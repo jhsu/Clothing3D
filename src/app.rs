@@ -6,6 +6,10 @@ use eframe::egui::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::curves::HandleSide;
+use crate::palette::{Entry, Palette};
+use crate::settings::Settings;
+use crate::units::Units;
 use crate::model::{Pattern, Piece, Point, PointKind, Vec2};
 use crate::sewing::{EdgeSpan, OutlinePos, Seam, point_at_fraction};
 use crate::view::View;
@@ -25,6 +29,7 @@ enum Tool {
     Select,
     Draw,
     AddPoint,
+    Curve,
     Sew,
 }
 
@@ -34,6 +39,7 @@ impl Tool {
             Tool::Select => "Select (V)",
             Tool::Draw => "Draw piece (P)",
             Tool::AddPoint => "Add point (A)",
+            Tool::Curve => "Edit curve (E)",
             Tool::Sew => "Free sewing (S)",
         }
     }
@@ -41,19 +47,88 @@ impl Tool {
     fn hint(self) -> &'static str {
         match self {
             Tool::Select => {
-                "Click a point or edge to select (Shift+click for several). Type a length + Enter \
-                 to resize one segment. Drag to move (arrows nudge). Double-click an edge to add \
-                 a point. R rotate, H flip, Ctrl+D duplicate, U unfold along selected edges"
+                "Click a point or edge to select (Shift+click for several), or drag a box on empty \
+                 canvas (Ctrl+drag over pieces) to select points. Type a length + Enter \
+                 to resize one segment. Drag to move (arrows nudge), drag handles to shape curves. \
+                 Double-click an edge to add a point. R rotate, H flip, Ctrl+D duplicate, U unfold"
             }
             Tool::Draw => {
                 "Click to place points, or type a length + Enter to place the next point toward the \
                  cursor. Click the first point or press Enter to close, Esc to stop"
             }
             Tool::AddPoint => "Click on an outline to insert a point",
+            Tool::Curve => {
+                "Drag an edge to bend it; double-click it to remove the curvature. Select points or \
+                 edges to show handles; drag a handle to shape the curve (Alt breaks a smooth point)"
+            }
             Tool::Sew => "Click a start point on an edge",
         }
     }
 }
+
+/// Everything runnable from the command palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Tool(Tool),
+    ClosePiece,
+    Undo,
+    Redo,
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Fit,
+    ToggleGrid,
+    ToggleSnapPoints,
+    ToggleMatchSnap,
+    ToggleLengths,
+    ToggleUnits,
+    Settings,
+    Delete,
+    ToggleCurve,
+    ClearHandles,
+    Straighten,
+    RotateCw,
+    RotateCcw,
+    FlipH,
+    FlipV,
+    Duplicate,
+    Unfold,
+}
+
+/// Palette rows: command, label, shortcut. Tools first, since activating a
+/// tool is the most common use.
+const COMMANDS: &[(Command, &str, &str)] = &[
+    (Command::Tool(Tool::Select), "Select tool", "V"),
+    (Command::Tool(Tool::Draw), "Draw piece tool", "P"),
+    (Command::Tool(Tool::AddPoint), "Add point tool", "A"),
+    (Command::Tool(Tool::Curve), "Edit curve tool", "E"),
+    (Command::Tool(Tool::Sew), "Free sewing tool", "S"),
+    (Command::ClosePiece, "Close piece being drawn", "Enter"),
+    (Command::Undo, "Undo", "Ctrl+Z"),
+    (Command::Redo, "Redo", "Ctrl+Shift+Z"),
+    (Command::New, "New pattern", ""),
+    (Command::Open, "Open pattern…", "Ctrl+O"),
+    (Command::Save, "Save pattern", "Ctrl+S"),
+    (Command::SaveAs, "Save pattern as…", ""),
+    (Command::Fit, "Fit view to pattern", "F"),
+    (Command::ToggleGrid, "Toggle grid snapping", "G"),
+    (Command::ToggleSnapPoints, "Toggle snap to points", ""),
+    (Command::ToggleMatchSnap, "Toggle snap to matching seam length", ""),
+    (Command::ToggleLengths, "Toggle segment length labels", "L"),
+    (Command::ToggleUnits, "Toggle units (mm / inches)", ""),
+    (Command::Settings, "Settings…", ""),
+    (Command::Delete, "Delete selection", "Del"),
+    (Command::ToggleCurve, "Toggle turn / curve point", "C"),
+    (Command::ClearHandles, "Clear point handles", ""),
+    (Command::Straighten, "Remove curvature from selected segments", "Shift+C"),
+    (Command::RotateCw, "Rotate piece 90° clockwise", "R"),
+    (Command::RotateCcw, "Rotate piece 90° counter-clockwise", "Shift+R"),
+    (Command::FlipH, "Flip piece horizontally", "H"),
+    (Command::FlipV, "Flip piece vertically", "Shift+H"),
+    (Command::Duplicate, "Duplicate piece", "Ctrl+D"),
+    (Command::Unfold, "Unfold piece along selected edges", "U"),
+];
 
 /// An in-progress drag with the Select tool.
 enum Drag {
@@ -62,6 +137,14 @@ enum Drag {
     /// Whole piece; positions are offset from the originals so grid snapping
     /// applies to the total displacement rather than accumulating error.
     Piece { piece: usize, start: Vec2, original: Vec<Vec2> },
+    /// One Bézier handle of a point.
+    Handle { point: PointRef, side: HandleSide },
+    /// Bending a segment: the curve point at `t` follows the cursor, starting
+    /// from the segment's handles when the drag began.
+    Bend { piece: usize, seg: usize, t: f64, grab: Vec2, start: (Vec2, Vec2) },
+    /// Rectangle selection between two screen positions; `additive` (Shift)
+    /// adds to the current selection instead of replacing it.
+    Marquee { start: Pos2, end: Pos2, additive: bool },
 }
 
 /// Progress through the four clicks of the free sewing tool.
@@ -89,11 +172,6 @@ struct Session {
     pattern: Pattern,
     file: Option<PathBuf>,
     view: View,
-    snap_grid: bool,
-    snap_step: f64,
-    snap_points: bool,
-    snap_match: bool,
-    seam_tolerance: f64,
 }
 
 impl Default for Session {
@@ -114,8 +192,6 @@ pub struct App {
     selected_segments: Vec<(usize, usize)>,
     /// Digits typed for a precise length (draw tool or selected segment).
     length_input: String,
-    /// Segment length edits move the segment's start point instead of its end.
-    length_moves_start: bool,
     /// Angle (degrees, counter-clockwise) for the "Rotate by" command.
     rotate_angle: f64,
     sew: SewState,
@@ -125,17 +201,18 @@ pub struct App {
     dragging: Option<Drag>,
     undo: Vec<Pattern>,
     redo: Vec<Pattern>,
-    snap_grid: bool,
-    snap_step: f64,
-    snap_points: bool,
-    /// Snap the end of the second sewing edge to where its length matches the first.
-    snap_match: bool,
-    /// Seam length difference (mm) above which a seam is flagged.
-    seam_tolerance: f64,
+    /// Application preferences, saved apart from the session.
+    settings: Settings,
+    /// Settings as last written to disk, to save only on change.
+    saved_settings: Settings,
+    show_settings: bool,
+    /// Edge under the last right-click `(piece, seg, t)`, for the context menu.
+    context_target: Option<(usize, usize, f64)>,
     file: Option<PathBuf>,
     status: String,
     cursor_world: Option<Vec2>,
     fit_requested: bool,
+    palette: Palette,
 }
 
 impl Default for App {
@@ -149,22 +226,21 @@ impl Default for App {
             selected_seam: None,
             selected_segments: Vec::new(),
             length_input: String::new(),
-            length_moves_start: false,
             rotate_angle: 15.0,
             sew: SewState::Idle,
             drawing: None,
             dragging: None,
             undo: Vec::new(),
             redo: Vec::new(),
-            snap_grid: true,
-            snap_step: 10.0,
-            snap_points: true,
-            snap_match: true,
-            seam_tolerance: 1.0,
+            settings: Settings::default(),
+            saved_settings: Settings::default(),
+            show_settings: false,
+            context_target: None,
             file: None,
             status: String::new(),
             cursor_world: None,
             fit_requested: false,
+            palette: Palette::default(),
         }
     }
 }
@@ -174,6 +250,12 @@ impl App {
     /// pattern file given on the command line takes precedence.
     pub fn new(storage: Option<&dyn eframe::Storage>, path: Option<PathBuf>) -> Self {
         let mut app = Self::default();
+        let (settings, error) = Settings::load();
+        app.saved_settings = settings.clone();
+        app.settings = settings;
+        if let Some(e) = error {
+            app.status = e;
+        }
         if let Some(session) = storage.and_then(|s| eframe::get_value::<Session>(s, SESSION_KEY)) {
             app.restore(session);
         }
@@ -190,11 +272,6 @@ impl App {
             pattern: self.pattern.clone(),
             file: self.file.clone(),
             view: self.view,
-            snap_grid: self.snap_grid,
-            snap_step: self.snap_step,
-            snap_points: self.snap_points,
-            snap_match: self.snap_match,
-            seam_tolerance: self.seam_tolerance,
         }
     }
 
@@ -202,11 +279,6 @@ impl App {
         self.pattern = s.pattern;
         self.file = s.file;
         self.view = s.view;
-        self.snap_grid = s.snap_grid;
-        self.snap_step = s.snap_step;
-        self.snap_points = s.snap_points;
-        self.snap_match = s.snap_match;
-        self.seam_tolerance = s.seam_tolerance;
         // A stale or hand-edited session must not leave dangling indices.
         self.validate_selection();
     }
@@ -384,8 +456,56 @@ impl App {
     fn set_point_kind(&mut self, kind: PointKind) {
         self.checkpoint();
         for r in &self.selected_points {
-            self.pattern.pieces[r.piece].points[r.point].kind = kind;
+            self.pattern.pieces[r.piece].set_point_kind(r.point, kind);
         }
+    }
+
+    fn clear_selected_handles(&mut self) {
+        self.checkpoint();
+        for r in &self.selected_points {
+            self.pattern.pieces[r.piece].clear_handles(r.point);
+        }
+    }
+
+    /// Remove the curvature of the selected segments.
+    fn straighten_selected(&mut self) {
+        if self.selected_segments.is_empty() {
+            self.status = "Select the segment(s) to remove curvature from".into();
+            return;
+        }
+        self.checkpoint();
+        for &(pi, seg) in &self.selected_segments {
+            self.pattern.pieces[pi].straighten_segment(seg);
+        }
+    }
+
+    /// Points whose handles are shown and draggable: selected points and the
+    /// end points of selected segments.
+    fn handle_points(&self) -> Vec<PointRef> {
+        let mut out = self.selected_points.clone();
+        for &(pi, seg) in &self.selected_segments {
+            let (a, b) = self.pattern.pieces[pi].segment_ends(seg);
+            for point in [a, b] {
+                let r = PointRef { piece: pi, point };
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
+    /// Visible handle under `screen`, if any.
+    fn pick_handle(&self, rect: Rect, screen: Pos2) -> Option<(PointRef, HandleSide)> {
+        self.handle_points().into_iter().find_map(|r| {
+            let piece = &self.pattern.pieces[r.piece];
+            let pos = piece.points[r.point].pos;
+            let (hin, hout) = piece.visible_handles(r.point);
+            [(hout, HandleSide::Out), (hin, HandleSide::In)].into_iter().find_map(|(h, side)| {
+                let h = h?;
+                (self.view.to_screen(rect, pos + h).distance(screen) <= PICK_PX).then_some((r, side))
+            })
+        })
     }
 
     // ------------------------------------------------------------- selection
@@ -420,6 +540,27 @@ impl App {
         self.selected_piece = Some(pi);
     }
 
+    /// Select the points inside screen rectangle `area` (added to the
+    /// selection when `additive`).
+    fn select_in_rect(&mut self, viewport: Rect, area: Rect, additive: bool) {
+        if !additive {
+            self.clear_selection();
+        }
+        self.length_input.clear();
+        self.selected_seam = None;
+        for (pi, piece) in self.pattern.pieces.iter().enumerate() {
+            for (i, p) in piece.points.iter().enumerate() {
+                let r = PointRef { piece: pi, point: i };
+                if area.contains(self.view.to_screen(viewport, p.pos)) && !self.selected_points.contains(&r) {
+                    self.selected_points.push(r);
+                }
+            }
+        }
+        if let Some(r) = self.selected_points.last() {
+            self.selected_piece = Some(r.piece);
+        }
+    }
+
     fn single_point(&self) -> Option<PointRef> {
         match self.selected_points[..] {
             [r] => Some(r),
@@ -446,7 +587,7 @@ impl App {
 
     fn set_segment_length(&mut self, pi: usize, seg: usize, len: f64) {
         self.checkpoint();
-        if !self.pattern.pieces[pi].set_segment_length(seg, len, self.length_moves_start) {
+        if !self.pattern.pieces[pi].set_segment_length(seg, len, self.settings.length_moves_start) {
             self.undo.pop();
             self.status = "Can't set the length of a zero-length segment".into();
         }
@@ -455,7 +596,7 @@ impl App {
     /// Apply the typed length: place the next point while drawing, or resize
     /// the selected segment.
     fn apply_length_input(&mut self) {
-        let Ok(len) = self.length_input.parse::<f64>() else {
+        let Some(len) = self.settings.units.parse(&self.length_input) else {
             self.status = format!("Not a length: {}", self.length_input);
             self.length_input.clear();
             return;
@@ -609,8 +750,8 @@ impl App {
 
     /// Round a displacement to the grid step when grid snapping is on.
     fn snap_offset(&self, d: Vec2) -> Vec2 {
-        if self.snap_grid && self.snap_step > 0.0 {
-            let s = self.snap_step;
+        if self.settings.snap_grid && self.settings.snap_step > 0.0 {
+            let s = self.settings.snap_step;
             Vec2::new((d.x / s).round() * s, (d.y / s).round() * s)
         } else {
             d
@@ -636,15 +777,15 @@ impl App {
 
     /// Snap a world position to existing points (excluding `skip`) or the grid.
     fn snap(&self, rect: Rect, screen: Pos2, skip: Option<PointRef>) -> Vec2 {
-        if self.snap_points
+        if self.settings.snap_points
             && let Some(r) = self.pick_point(rect, screen)
             && Some(r) != skip
         {
             return self.pattern.pieces[r.piece].points[r.point].pos;
         }
         let w = self.view.to_world(rect, screen);
-        if self.snap_grid && self.snap_step > 0.0 {
-            let s = self.snap_step;
+        if self.settings.snap_grid && self.settings.snap_step > 0.0 {
+            let s = self.settings.snap_step;
             Vec2::new((w.x / s).round() * s, (w.y / s).round() * s)
         } else {
             w
@@ -680,21 +821,71 @@ impl App {
         self.cursor_world = hover.map(|h| self.view.to_world(rect, h));
 
         match self.tool {
-            Tool::Select => self.select_tool(&response, rect),
+            Tool::Select | Tool::Curve => self.select_tool(&response, rect),
             Tool::Draw => self.draw_tool(&response, rect),
             Tool::AddPoint => self.add_point_tool(&response, rect),
             Tool::Sew => self.sew_tool(&response, rect),
         }
 
+        if response.secondary_clicked() {
+            self.context_target = response
+                .interact_pointer_pos()
+                .and_then(|pos| self.pick_outline(rect, pos))
+                .map(|(pi, seg, t, _)| (pi, seg, t));
+        }
+        response.context_menu(|ui| self.viewport_context_menu(ui));
+
         self.paint(&painter, rect, hover);
     }
 
+    /// Right-click menu: segment actions when an edge was clicked.
+    fn viewport_context_menu(&mut self, ui: &mut egui::Ui) {
+        if let Some((pi, seg, t)) = self.context_target
+            && pi < self.pattern.pieces.len()
+            && seg < self.pattern.pieces[pi].segment_count()
+        {
+            let curved = self.pattern.pieces[pi].segment_is_curved(seg);
+            if ui.add_enabled(curved, egui::Button::new("Remove curvature")).clicked() {
+                self.checkpoint();
+                self.pattern.pieces[pi].straighten_segment(seg);
+                self.select_segment(pi, seg, false);
+                ui.close();
+            }
+            if ui.button("Insert point here").clicked() {
+                self.checkpoint();
+                let idx = self.pattern.insert_point(pi, seg, t);
+                self.select_point(PointRef { piece: pi, point: idx }, false);
+                ui.close();
+            }
+            if ui.button("Select segment").clicked() {
+                self.select_segment(pi, seg, false);
+                ui.close();
+            }
+            ui.separator();
+        }
+        if ui.button("Fit to pattern").clicked() {
+            self.fit_requested = true;
+            ui.close();
+        }
+        if ui.button("Command palette…").clicked() {
+            self.palette.open();
+            ui.close();
+        }
+    }
+
     fn select_tool(&mut self, response: &egui::Response, rect: Rect) {
-        let shift = response.ctx.input(|i| i.modifiers.shift);
+        let (shift, alt, ctrl) =
+            response.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt, i.modifiers.command));
         if response.drag_started_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
         {
-            if let Some(r) = self.pick_point(rect, pos) {
+            // Ctrl forces a selection rectangle even when starting over a piece.
+            if ctrl {
+                self.dragging = Some(Drag::Marquee { start: pos, end: pos, additive: shift });
+            } else if let Some((point, side)) = self.pick_handle(rect, pos) {
+                self.checkpoint();
+                self.dragging = Some(Drag::Handle { point, side });
+            } else if let Some(r) = self.pick_point(rect, pos) {
                 // Dragging an unselected point selects it (Shift adds it) first.
                 if !self.selected_points.contains(&r) {
                     if shift {
@@ -709,7 +900,17 @@ impl App {
                 let original =
                     self.selected_points.iter().map(|&q| (q, pieces[q.piece].points[q.point].pos)).collect();
                 self.dragging = Some(Drag::Points { grabbed: r, original });
-            } else if let Some(pi) = self.pick_piece(rect, pos) {
+            } else if self.tool == Tool::Curve
+                && let Some((pi, seg, t, _)) = self.pick_outline(rect, pos)
+            {
+                self.checkpoint();
+                self.select_segment(pi, seg, false);
+                let start = self.pattern.pieces[pi].segment_handles(seg);
+                let grab = self.view.to_world(rect, pos);
+                self.dragging = Some(Drag::Bend { piece: pi, seg, t, grab, start });
+            } else if self.tool == Tool::Select
+                && let Some(pi) = self.pick_piece(rect, pos)
+            {
                 self.checkpoint();
                 let original = self.pattern.pieces[pi].points.iter().map(|p| p.pos).collect();
                 let start = self.view.to_world(rect, pos);
@@ -718,12 +919,19 @@ impl App {
                     self.clear_selection();
                     self.selected_piece = Some(pi);
                 }
+            } else if self.pick_outline(rect, pos).is_none() {
+                // Empty canvas (or a piece's fill in the curve tool): rectangle selection.
+                self.dragging = Some(Drag::Marquee { start: pos, end: pos, additive: shift });
             }
         }
         if response.dragged_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
         {
+            if let Some(Drag::Marquee { end, .. }) = &mut self.dragging {
+                *end = pos;
+            }
             match &self.dragging {
+                Some(Drag::Marquee { .. }) => {}
                 Some(Drag::Points { grabbed, original }) => {
                     let start = original.iter().find(|(q, _)| q == grabbed).map(|(_, p)| *p);
                     if let Some(start) = start {
@@ -739,8 +947,22 @@ impl App {
                         p.pos = *o + d;
                     }
                 }
+                &Some(Drag::Handle { point, side }) => {
+                    let piece = &mut self.pattern.pieces[point.piece];
+                    let offset = self.view.to_world(rect, pos) - piece.points[point.point].pos;
+                    piece.set_handle(point.point, side, offset, !alt);
+                }
+                &Some(Drag::Bend { piece, seg, t, grab, start }) => {
+                    let delta = self.view.to_world(rect, pos) - grab;
+                    self.pattern.pieces[piece].bend_segment(seg, t, start, delta);
+                }
                 None => {}
             }
+        }
+        if response.drag_stopped()
+            && let Some(Drag::Marquee { start, end, additive }) = self.dragging.take()
+        {
+            self.select_in_rect(rect, Rect::from_two_pos(start, end), additive);
         }
         if response.drag_stopped() {
             self.dragging = None;
@@ -751,8 +973,14 @@ impl App {
             && let Some((pi, seg, t, _)) = self.pick_outline(rect, pos)
         {
             self.checkpoint();
-            let idx = self.pattern.insert_point(pi, seg, t);
-            self.select_point(PointRef { piece: pi, point: idx }, false);
+            if self.tool == Tool::Curve {
+                // Double-clicking an edge in the curve tool removes its curvature.
+                self.pattern.pieces[pi].straighten_segment(seg);
+                self.select_segment(pi, seg, false);
+            } else {
+                let idx = self.pattern.insert_point(pi, seg, t);
+                self.select_point(PointRef { piece: pi, point: idx }, false);
+            }
         } else if response.clicked_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -839,7 +1067,9 @@ impl App {
                     self.pattern.seams.push(Seam { a, b: span });
                     self.selected_seam = Some(self.pattern.seams.len() - 1);
                     let [la, lb] = [a, span].map(|s| s.length(&self.pattern.pieces));
-                    self.status = format!("Seam created: {la:.1} mm ↔ {lb:.1} mm (Δ {:.1} mm)", la - lb);
+                    let u = self.settings.units;
+                    self.status =
+                        format!("Seam created: {} ↔ {} (Δ {})", u.format(la), u.format(lb), u.format(la - lb));
                     self.sew = SewState::Idle;
                 } else {
                     self.sew = SewState::First(span);
@@ -872,7 +1102,7 @@ impl App {
         };
         let piece = &self.pattern.pieces[start_piece];
         if let Some(a) = first
-            && self.snap_match
+            && self.settings.snap_match
             && !no_snap
             && let Some((span, _)) = self
                 .matching_ends(&a, start_piece, start)
@@ -964,6 +1194,10 @@ impl App {
             }
         }
 
+        if self.settings.show_lengths {
+            self.paint_segment_lengths(&painter, rect);
+        }
+
         let orange = Color32::from_rgb(240, 120, 0);
         for &(pi, seg) in &self.selected_segments {
             let pts: Vec<Pos2> =
@@ -979,27 +1213,35 @@ impl App {
                     .iter()
                     .map(|&(p, s)| self.pattern.pieces[p].segment_length(s))
                     .sum();
-                format!("{} segments · {total:.1} mm", self.selected_segments.len())
+                format!("{} segments · {}", self.selected_segments.len(), self.settings.units.format(total))
             } else if self.length_input.is_empty() {
-                format!("{:.1} mm", piece.segment_length(seg))
+                self.settings.units.format(piece.segment_length(seg))
             } else {
-                format!("{}_ mm  ⏎ to apply", self.length_input)
+                format!("{}_{}  ⏎ to apply", self.length_input, self.settings.units.suffix())
             };
             paint_label(&painter, mid + egui::vec2(12.0, -14.0), &text, Color32::from_rgb(180, 80, 0));
         }
+
+        self.paint_handles(&painter, rect);
 
         for (i, seam) in self.pattern.seams.iter().enumerate() {
             let selected = self.selected_seam == Some(i);
             self.paint_seam(&painter, rect, seam, seam_color(i), selected, true);
         }
         self.paint_sewing_preview(&painter, rect, hover);
+        if let Some(Drag::Marquee { start, end, .. }) = self.dragging {
+            let area = Rect::from_two_pos(start, end);
+            let blue = Color32::from_rgb(20, 110, 220);
+            painter.rect_filled(area, 0.0, blue.gamma_multiply(0.12));
+            painter.rect_stroke(area, 0.0, Stroke::new(1.0, blue), egui::StrokeKind::Middle);
+        }
 
         let Some(hover) = hover else { return };
         match self.tool {
             Tool::Sew => {}
             Tool::Draw => {
                 let mut w = self.snap(rect, hover, None);
-                let typed = self.length_input.parse::<f64>().ok().filter(|l| *l > 0.0);
+                let typed = self.settings.units.parse(&self.length_input).filter(|l| *l > 0.0);
                 if let (Some(len), Some(idx)) = (typed, self.drawing)
                     && let Some(last) = self.pattern.pieces[idx].points.last()
                 {
@@ -1020,16 +1262,18 @@ impl App {
                     );
                     painter.extend(dashed);
                     let text = if self.length_input.is_empty() {
-                        format!("{:.1} mm", (w - last.pos).length())
+                        self.settings.units.format((w - last.pos).length())
                     } else {
-                        format!("{}_ mm  ⏎ to place", self.length_input)
+                        format!("{}_{}  ⏎ to place", self.length_input, self.settings.units.suffix())
                     };
                     paint_label(&painter, s + egui::vec2(12.0, 14.0), &text, Color32::DARK_GRAY);
                 }
                 painter.circle_stroke(s, 4.0, Stroke::new(1.0, Color32::from_rgb(240, 120, 0)));
             }
-            Tool::AddPoint | Tool::Select => {
-                if self.tool == Tool::Select && self.pick_point(rect, hover).is_some() {
+            Tool::AddPoint | Tool::Select | Tool::Curve => {
+                if self.tool != Tool::AddPoint
+                    && (self.pick_point(rect, hover).is_some() || self.pick_handle(rect, hover).is_some())
+                {
                     return;
                 }
                 if let Some((_, _, _, pos)) = self.pick_outline(rect, hover) {
@@ -1039,6 +1283,69 @@ impl App {
                         Stroke::new(1.5, Color32::from_rgb(240, 120, 0)),
                     );
                 }
+            }
+        }
+    }
+
+    /// Length label beside every segment long enough on screen to fit one,
+    /// on the outside of closed pieces.
+    fn paint_segment_lengths(&self, painter: &egui::Painter, rect: Rect) {
+        let units = self.settings.units;
+        let color = Color32::from_rgb(70, 70, 90);
+        for piece in &self.pattern.pieces {
+            // Outward is to the right of travel for counter-clockwise outlines.
+            let side = if piece.closed && piece.area() < 0.0 { -1.0 } else { 1.0 };
+            for seg in 0..piece.segment_count() {
+                let (a, b) = piece.segment_ends(seg);
+                let (pa, pb) = (piece.points[a].pos, piece.points[b].pos);
+                if self.view.to_screen(rect, pa).distance(self.view.to_screen(rect, pb)) < 50.0 {
+                    continue;
+                }
+                let mid = piece.eval_segment(seg, 0.5);
+                // Direction of travel at the midpoint, from a nearby sample.
+                let dir = piece.eval_segment(seg, 0.51) - piece.eval_segment(seg, 0.49);
+                let len = dir.length();
+                if len < 1e-12 {
+                    continue;
+                }
+                // World Y is up and screen Y down, so the right-hand normal flips in y.
+                let n = egui::vec2((dir.y / len * side) as f32, (dir.x / len * side) as f32);
+                let pos = self.view.to_screen(rect, mid) + n * 8.0;
+                // Anchor on the side facing the edge so the label never covers it.
+                let anchor = if n.x > 0.5 {
+                    Align2::LEFT_CENTER
+                } else if n.x < -0.5 {
+                    Align2::RIGHT_CENTER
+                } else if n.y > 0.0 {
+                    Align2::CENTER_TOP
+                } else {
+                    Align2::CENTER_BOTTOM
+                };
+                let text = units.format(piece.segment_length(seg));
+                paint_label_at(painter, pos, anchor, 11.0, &text, color);
+            }
+        }
+    }
+
+    /// Handles of the selected points / segment ends. Explicit handles are
+    /// solid; automatic ones (curve points without handles) are dashed.
+    fn paint_handles(&self, painter: &egui::Painter, rect: Rect) {
+        let color = Color32::from_rgb(120, 60, 200);
+        for r in self.handle_points() {
+            let piece = &self.pattern.pieces[r.piece];
+            let point = &piece.points[r.point];
+            let base = self.view.to_screen(rect, point.pos);
+            let (hin, hout) = piece.visible_handles(r.point);
+            for (h, explicit) in [(hin, point.handle_in.is_some()), (hout, point.handle_out.is_some())] {
+                let Some(h) = h else { continue };
+                let tip = self.view.to_screen(rect, point.pos + h);
+                if explicit {
+                    painter.line_segment([base, tip], Stroke::new(1.0, color));
+                } else {
+                    painter.extend(egui::Shape::dashed_line(&[base, tip], Stroke::new(1.0, color), 4.0, 3.0));
+                }
+                painter.circle_filled(tip, 4.0, if explicit { color } else { Color32::WHITE });
+                painter.circle_stroke(tip, 4.0, Stroke::new(1.2, color));
             }
         }
     }
@@ -1102,11 +1409,11 @@ impl App {
         }
 
         let [la, lb] = seam.spans().map(|s| s.length(&self.pattern.pieces));
-        if badge && (la - lb).abs() > self.seam_tolerance {
+        if badge && (la - lb).abs() > self.settings.seam_tolerance {
             let mid = to_pos(point_at_fraction(&wa, 0.5).lerp(point_at_fraction(&wb, 0.5), 0.5));
             painter.circle_filled(mid, 8.0, WARN_COLOR);
             painter.text(mid, Align2::CENTER_CENTER, "!", FontId::proportional(12.0), Color32::WHITE);
-            paint_label(painter, mid + egui::vec2(12.0, 0.0), &format!("Δ {:.1} mm", la - lb), WARN_COLOR);
+            paint_label(painter, mid + egui::vec2(12.0, 0.0), &format!("Δ {}", self.settings.units.format(la - lb)), WARN_COLOR);
         }
     }
 
@@ -1115,6 +1422,7 @@ impl App {
             return;
         }
         let pieces = &self.pattern.pieces;
+        let u = self.settings.units;
         let color = seam_color(self.pattern.seams.len());
         let no_snap = painter.ctx().input(|i| i.modifiers.alt);
         let pending = hover.and_then(|h| self.pending_span(rect, h, no_snap));
@@ -1131,17 +1439,17 @@ impl App {
                 marker(pi, start);
                 if let Some((span, _)) = pending {
                     self.paint_span(painter, rect, &span, color.gamma_multiply(0.6), 2.5);
-                    readout = Some((format!("A {:.1} mm", span.length(pieces)), Color32::DARK_GRAY));
+                    readout = Some((format!("A {}", u.format(span.length(pieces))), Color32::DARK_GRAY));
                 }
             }
             SewState::First(a) => {
                 self.paint_span(painter, rect, &a, color, 2.5);
-                readout = Some((format!("A {:.1} mm", a.length(pieces)), Color32::DARK_GRAY));
+                readout = Some((format!("A {}", u.format(a.length(pieces))), Color32::DARK_GRAY));
             }
             SewState::SecondStart(a, pi, start) => {
                 self.paint_span(painter, rect, &a, color, 2.5);
                 marker(pi, start);
-                if self.snap_match && !no_snap {
+                if self.settings.snap_match && !no_snap {
                     for end in self.matching_ends(&a, pi, start) {
                         let s = self.view.to_screen(rect, pieces[pi].eval_pos(end.end));
                         let diamond = [(0.0, -7.0), (7.0, 0.0), (0.0, 7.0), (-7.0, 0.0)]
@@ -1155,16 +1463,18 @@ impl App {
                     }
                 }
                 let la = a.length(pieces);
-                readout = Some((format!("A {la:.1} mm"), Color32::DARK_GRAY));
+                readout = Some((format!("A {}", u.format(la)), Color32::DARK_GRAY));
                 if let Some((b, snapped)) = pending {
                     let seam = Seam { a, b };
                     self.paint_seam(painter, rect, &seam, color.gamma_multiply(0.6), false, false);
                     let lb = b.length(pieces);
-                    let ok = (la - lb).abs() <= self.seam_tolerance;
+                    let ok = (la - lb).abs() <= self.settings.seam_tolerance;
                     readout = Some((
                         format!(
-                            "A {la:.1} mm · B {lb:.1} mm · Δ {:.1}{}",
-                            la - lb,
+                            "A {} · B {} · Δ {}{}",
+                            u.format(la),
+                            u.format(lb),
+                            u.number(la - lb),
                             if snapped { "  (matched)" } else { "" }
                         ),
                         if ok { OK_COLOR } else { WARN_COLOR },
@@ -1187,8 +1497,7 @@ impl App {
     }
 
     fn paint_grid(&self, painter: &egui::Painter, rect: Rect) {
-        let minor = self.view.grid_step(8.0);
-        let major = minor * 10.0;
+        let (minor, major) = self.settings.units.grid_steps(self.view.zoom, 8.0);
         let lo = self.view.to_world(rect, rect.left_bottom());
         let hi = self.view.to_world(rect, rect.right_top());
 
@@ -1239,6 +1548,8 @@ impl App {
                     Some(Tool::Draw)
                 } else if i.key_pressed(Key::A) {
                     Some(Tool::AddPoint)
+                } else if i.key_pressed(Key::E) {
+                    Some(Tool::Curve)
                 } else if i.key_pressed(Key::S) && !i.modifiers.command {
                     Some(Tool::Sew)
                 } else {
@@ -1253,7 +1564,7 @@ impl App {
                     i.consume_key(cmd, Key::O),
                     tool,
                     i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
-                    i.key_pressed(Key::C),
+                    i.key_pressed(Key::C).then_some(i.modifiers.shift),
                     i.key_pressed(Key::Enter),
                     i.key_pressed(Key::Escape),
                     i.key_pressed(Key::F),
@@ -1278,8 +1589,10 @@ impl App {
         if del {
             self.delete_selection();
         }
-        if curve {
-            self.toggle_curve();
+        match curve {
+            Some(true) => self.straighten_selected(),
+            Some(false) => self.toggle_curve(),
+            None => {}
         }
         if enter && self.drawing.is_some() {
             self.checkpoint();
@@ -1313,30 +1626,36 @@ impl App {
                 (d, i.modifiers.shift)
             });
             if nudge != Vec2::default() {
-                // Arrows move one grid step (or 10 mm without snapping); Shift moves 1 mm.
+                // Arrows move one grid step (or the unit's nudge step without
+                // snapping); Shift moves the fine step.
+                let (normal, fine_step) = self.settings.units.nudge_steps();
                 let step = if fine {
-                    1.0
-                } else if self.snap_grid {
-                    self.snap_step
+                    fine_step
+                } else if self.settings.snap_grid {
+                    self.settings.snap_step
                 } else {
-                    10.0
+                    normal
                 };
                 self.nudge_selected(nudge * step);
             }
         }
         if snap {
-            self.snap_grid = !self.snap_grid;
+            self.settings.snap_grid = !self.settings.snap_grid;
         }
 
-        let (rotate, flip, unfold, duplicate) = ctx.input_mut(|i| {
+        let (rotate, flip, unfold, duplicate, lengths) = ctx.input_mut(|i| {
             let plain = !i.modifiers.command && !i.modifiers.alt;
             (
                 (plain && i.key_pressed(Key::R)).then_some(if i.modifiers.shift { 90.0 } else { -90.0 }),
                 (plain && i.key_pressed(Key::H)).then_some(!i.modifiers.shift),
                 plain && i.key_pressed(Key::U),
                 i.consume_key(Modifiers::COMMAND, Key::D),
+                plain && i.key_pressed(Key::L),
             )
         });
+        if lengths {
+            self.settings.show_lengths = !self.settings.show_lengths;
+        }
         if let Some(deg) = rotate {
             self.rotate_selected(deg);
         }
@@ -1363,11 +1682,12 @@ impl App {
                     _ => None,
                 })
                 .flat_map(str::chars)
-                .filter(|c| c.is_ascii_digit() || *c == '.')
+                .filter(|c| c.is_ascii_digit() || matches!(c, '.' | '/' | ' '))
                 .collect()
         });
         for c in typed.chars() {
-            if c != '.' || !self.length_input.contains('.') {
+            // Space and '/' only make sense after a number (`3 1/2`, `3/8`).
+            if c.is_ascii_digit() || (!self.length_input.is_empty() && !self.length_input.ends_with(' ')) {
                 self.length_input.push(c);
             }
         }
@@ -1390,6 +1710,71 @@ impl App {
         }
         if enter {
             self.apply_length_input();
+        }
+    }
+
+    // -------------------------------------------------------- command palette
+
+    /// Whether a command can run right now (others are listed greyed out).
+    fn command_enabled(&self, cmd: Command) -> bool {
+        let piece = self.selected_piece.is_some();
+        match cmd {
+            Command::ClosePiece => self.drawing.is_some(),
+            Command::Undo => !self.undo.is_empty(),
+            Command::Redo => !self.redo.is_empty(),
+            Command::Delete => piece || self.selected_seam.is_some(),
+            Command::ToggleCurve | Command::ClearHandles => !self.selected_points.is_empty(),
+            Command::Straighten => !self.selected_segments.is_empty(),
+            Command::RotateCw
+            | Command::RotateCcw
+            | Command::FlipH
+            | Command::FlipV
+            | Command::Duplicate => piece,
+            Command::Unfold => self.can_unfold(),
+            _ => true,
+        }
+    }
+
+    fn run_command(&mut self, cmd: Command) {
+        match cmd {
+            Command::Tool(tool) => self.set_tool(tool),
+            Command::ClosePiece => {
+                self.checkpoint();
+                self.finish_drawing(true);
+            }
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
+            Command::New => self.new_pattern(),
+            Command::Open => self.open(),
+            Command::Save => self.save(false),
+            Command::SaveAs => self.save(true),
+            Command::Fit => self.fit_requested = true,
+            Command::ToggleGrid => self.settings.snap_grid = !self.settings.snap_grid,
+            Command::ToggleSnapPoints => self.settings.snap_points = !self.settings.snap_points,
+            Command::ToggleMatchSnap => self.settings.snap_match = !self.settings.snap_match,
+            Command::ToggleLengths => self.settings.show_lengths = !self.settings.show_lengths,
+            Command::ToggleUnits => self.settings.toggle_units(),
+            Command::Settings => self.show_settings = true,
+            Command::Delete => self.delete_selection(),
+            Command::ToggleCurve => self.toggle_curve(),
+            Command::ClearHandles => self.clear_selected_handles(),
+            Command::Straighten => self.straighten_selected(),
+            Command::RotateCw => self.rotate_selected(-90.0),
+            Command::RotateCcw => self.rotate_selected(90.0),
+            Command::FlipH => self.flip_selected(true),
+            Command::FlipV => self.flip_selected(false),
+            Command::Duplicate => self.duplicate_selected(),
+            Command::Unfold => self.unfold_selected(),
+        }
+    }
+
+    fn show_palette(&mut self, ctx: &egui::Context) {
+        let entries: Vec<Entry> = COMMANDS
+            .iter()
+            .map(|&(cmd, label, shortcut)| Entry { label, shortcut, enabled: self.command_enabled(cmd) })
+            .collect();
+        if let Some(i) = self.palette.show(ctx, &entries) {
+            self.run_command(COMMANDS[i].0);
         }
     }
 
@@ -1433,6 +1818,16 @@ impl App {
                     self.delete_selection();
                     ui.close();
                 }
+                let curved = self.selected_segments.iter().any(|&(p, s)| self.pattern.pieces[p].segment_is_curved(s));
+                if ui.add_enabled(curved, egui::Button::new("Remove curvature  (Shift+C)")).clicked() {
+                    self.straighten_selected();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Settings…").clicked() {
+                    self.show_settings = true;
+                    ui.close();
+                }
             });
             ui.menu_button("Piece", |ui| {
                 let has = self.selected_piece.is_some();
@@ -1464,6 +1859,21 @@ impl App {
                 }
             });
             ui.menu_button("View", |ui| {
+                if ui.button("Command palette  (Ctrl+K)").clicked() {
+                    self.palette.open();
+                    ui.close();
+                }
+                ui.checkbox(&mut self.settings.show_lengths, "Segment lengths  (L)");
+                ui.menu_button("Units", |ui| {
+                    for units in [Units::Millimeters, Units::Inches] {
+                        if ui.radio(self.settings.units == units, units.name()).clicked()
+                            && self.settings.units != units
+                        {
+                            self.settings.toggle_units();
+                        }
+                    }
+                });
+                ui.separator();
                 if ui.button("Fit to pattern  (F)").clicked() {
                     self.fit_requested = true;
                     ui.close();
@@ -1474,7 +1884,7 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
-        for tool in [Tool::Select, Tool::Draw, Tool::AddPoint, Tool::Sew] {
+        for tool in [Tool::Select, Tool::Draw, Tool::AddPoint, Tool::Curve, Tool::Sew] {
             if ui.selectable_label(self.tool == tool, tool.label()).clicked() {
                 self.set_tool(tool);
             }
@@ -1482,22 +1892,23 @@ impl App {
 
         ui.separator();
         ui.heading("Snapping");
-        ui.checkbox(&mut self.snap_points, "Snap to points");
+        ui.checkbox(&mut self.settings.snap_points, "Snap to points");
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.snap_grid, "Grid (G)");
-            ui.add_enabled(
-                self.snap_grid,
-                egui::DragValue::new(&mut self.snap_step).range(0.1..=1000.0).suffix(" mm"),
-            );
+            ui.checkbox(&mut self.settings.snap_grid, "Grid (G)");
+            let units = self.settings.units;
+            ui.add_enabled_ui(self.settings.snap_grid, |ui| {
+                length_value(ui, &mut self.settings.snap_step, units, 0.1..=1000.0);
+            });
         });
 
         ui.separator();
         ui.heading("Sewing");
-        ui.checkbox(&mut self.snap_match, "Snap to matching length")
+        ui.checkbox(&mut self.settings.snap_match, "Snap to matching length")
             .on_hover_text("While sewing the second edge, snap its end to where its length equals the first edge. Hold Alt to bypass.");
         ui.horizontal(|ui| {
             ui.label("Tolerance");
-            ui.add(egui::DragValue::new(&mut self.seam_tolerance).range(0.0..=50.0).speed(0.1).suffix(" mm"))
+            let units = self.settings.units;
+            length_value(ui, &mut self.settings.seam_tolerance, units, 0.0..=50.0)
                 .on_hover_text("Seams whose edge lengths differ by more than this are flagged");
         });
 
@@ -1535,9 +1946,9 @@ impl App {
             let piece = &mut self.pattern.pieces[pi];
             piece.name = name;
             if piece.closed {
-                ui.label(format!("Area: {:.1} cm²", piece.area().abs() / 100.0));
+                ui.label(format!("Area: {}", self.settings.units.format_area(piece.area().abs())));
             }
-            ui.label(format!("Perimeter: {:.1} mm", piece.perimeter()));
+            ui.label(format!("Perimeter: {}", self.settings.units.format(piece.perimeter())));
             self.transform_panel(ui);
             self.segments_panel(ui, pi);
         }
@@ -1553,6 +1964,9 @@ impl App {
                 if ui.button("Curve").clicked() {
                     self.set_point_kind(PointKind::Curve);
                 }
+                if ui.button("Clear handles").clicked() {
+                    self.clear_selected_handles();
+                }
             });
         }
 
@@ -1560,11 +1974,14 @@ impl App {
             ui.separator();
             ui.heading(format!("Point {}", r.point + 1));
             let mut p = self.pattern.pieces[r.piece].points[r.point];
+            let kind_before = p.kind;
             let mut begin_edit = false;
+            let mut clear_handles = false;
+            let units = self.settings.units;
             egui::Grid::new("point").num_columns(2).show(ui, |ui| {
                 for (label, v) in [("X", &mut p.pos.x), ("Y", &mut p.pos.y)] {
                     ui.label(label);
-                    let resp = ui.add(egui::DragValue::new(v).speed(0.5).suffix(" mm"));
+                    let resp = length_value(ui, v, units, f64::MIN..=f64::MAX);
                     begin_edit |= resp.drag_started() || resp.gained_focus();
                     ui.end_row();
                 }
@@ -1574,11 +1991,26 @@ impl App {
                     begin_edit |= ui.radio_value(&mut p.kind, PointKind::Curve, "Curve").clicked();
                 });
                 ui.end_row();
+                if p.has_handles() {
+                    ui.label("Handles");
+                    clear_handles = ui
+                        .button("Clear")
+                        .on_hover_text("Remove explicit handles (curve points go back to automatic smoothing)")
+                        .clicked();
+                    ui.end_row();
+                }
             });
-            if begin_edit {
+            if begin_edit || clear_handles {
                 self.checkpoint();
             }
-            self.pattern.pieces[r.piece].points[r.point] = p;
+            let piece = &mut self.pattern.pieces[r.piece];
+            piece.points[r.point] = p;
+            if p.kind != kind_before {
+                piece.set_point_kind(r.point, p.kind);
+            }
+            if clear_handles {
+                piece.clear_handles(r.point);
+            }
         }
     }
 
@@ -1632,6 +2064,7 @@ impl App {
             return;
         }
         let additive = ui.input(|i| i.modifiers.shift);
+        let units = self.settings.units;
         let mut select = None;
         let mut begin_edit = false;
         let mut change = None;
@@ -1640,8 +2073,8 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Edits move");
-                    ui.radio_value(&mut self.length_moves_start, false, "end point");
-                    ui.radio_value(&mut self.length_moves_start, true, "start point");
+                    ui.radio_value(&mut self.settings.length_moves_start, false, "end point");
+                    ui.radio_value(&mut self.settings.length_moves_start, true, "start point");
                 });
                 egui::Grid::new("segments").num_columns(2).striped(true).show(ui, |ui| {
                     for (seg, &(a, b, len)) in rows.iter().enumerate() {
@@ -1651,13 +2084,7 @@ impl App {
                             select = Some(seg);
                         }
                         let mut v = len;
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut v)
-                                .speed(0.5)
-                                .range(0.1..=100_000.0)
-                                .max_decimals(1)
-                                .suffix(" mm"),
-                        );
+                        let resp = length_value(ui, &mut v, units, 0.1..=100_000.0);
                         begin_edit |= resp.drag_started() || resp.gained_focus();
                         if resp.changed() {
                             change = Some((seg, v));
@@ -1666,6 +2093,16 @@ impl App {
                     }
                 });
             });
+        let any_curved = self.selected_segments.iter().any(|&(p, s)| self.pattern.pieces[p].segment_is_curved(s));
+        if !self.selected_segments.is_empty()
+            && ui
+                .add_enabled(any_curved, egui::Button::new("Remove curvature"))
+                .on_hover_text("Make the selected segments straight; neighbors keep their shape (Shift+C)")
+                .on_disabled_hover_text("The selected segments are already straight")
+                .clicked()
+        {
+            self.straighten_selected();
+        }
         if let Some(seg) = select {
             self.select_segment(pi, seg, additive);
         }
@@ -1673,7 +2110,7 @@ impl App {
             self.checkpoint();
         }
         if let Some((seg, len)) = change {
-            self.pattern.pieces[pi].set_segment_length(seg, len, self.length_moves_start);
+            self.pattern.pieces[pi].set_segment_length(seg, len, self.settings.length_moves_start);
         }
     }
 
@@ -1687,13 +2124,13 @@ impl App {
         let mut clicked = None;
         for (i, seam) in self.pattern.seams.iter().enumerate() {
             let [la, lb] = seam.spans().map(|s| s.length(pieces));
-            let mismatch = (la - lb).abs() > self.seam_tolerance;
+            let mismatch = (la - lb).abs() > self.settings.seam_tolerance;
             let text = egui::RichText::new(format!(
-                "Seam {}: {} ↔ {}  Δ {:.1}{}",
+                "Seam {}: {} ↔ {}  Δ {}{}",
                 i + 1,
                 pieces[seam.a.piece].name,
                 pieces[seam.b.piece].name,
-                la - lb,
+                self.settings.units.number(la - lb),
                 if mismatch { "  ⚠" } else { "" }
             ))
             .color(seam_color(i));
@@ -1703,8 +2140,8 @@ impl App {
             }
             if mismatch {
                 resp.on_hover_text(format!(
-                    "Edge lengths differ by more than the {:.1} mm tolerance",
-                    self.seam_tolerance
+                    "Edge lengths differ by more than the {} tolerance",
+                    self.settings.units.format(self.settings.seam_tolerance)
                 ));
             }
         }
@@ -1716,7 +2153,8 @@ impl App {
         let Some(i) = self.selected_seam else { return };
         let seam = self.pattern.seams[i];
         let [la, lb] = seam.spans().map(|s| s.length(&self.pattern.pieces));
-        ui.label(format!("Edge A: {la:.1} mm   Edge B: {lb:.1} mm"));
+        let u = self.settings.units;
+        ui.label(format!("Edge A: {}   Edge B: {}", u.format(la), u.format(lb)));
         ui.horizontal(|ui| {
             if ui.button("Flip B").on_hover_text("Reverse direction of edge B").clicked() {
                 self.checkpoint();
@@ -1739,10 +2177,85 @@ impl App {
         });
     }
 
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("Settings").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            let s = &mut self.settings;
+            egui::Grid::new("settings").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                ui.label("Units");
+                ui.horizontal(|ui| {
+                    for units in [Units::Millimeters, Units::Inches] {
+                        if ui.radio(s.units == units, units.name()).clicked() && s.units != units {
+                            s.toggle_units();
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Segment lengths");
+                ui.checkbox(&mut s.show_lengths, "Label every segment (L)");
+                ui.end_row();
+
+                ui.label("Snapping");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut s.snap_points, "Snap to points");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.snap_grid, "Grid step");
+                        let units = s.units;
+                        length_value(ui, &mut s.snap_step, units, 0.1..=1000.0);
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Sewing");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut s.snap_match, "Snap to matching length");
+                    ui.horizontal(|ui| {
+                        ui.label("Length tolerance");
+                        let units = s.units;
+                        length_value(ui, &mut s.seam_tolerance, units, 0.0..=50.0);
+                    });
+                });
+                ui.end_row();
+
+                ui.label("Segment length edits");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut s.length_moves_start, false, "move end point");
+                    ui.radio_value(&mut s.length_moves_start, true, "move start point");
+                });
+                ui.end_row();
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Reset to defaults").clicked() {
+                    *s = Settings::default();
+                }
+                if let Some(path) = Settings::path() {
+                    ui.weak(format!("Saved to {}", path.display()));
+                }
+            });
+        });
+        self.show_settings = open;
+    }
+
+    /// Write settings to disk if they changed since the last save.
+    fn save_settings(&mut self) {
+        if self.settings == self.saved_settings {
+            return;
+        }
+        match self.settings.save() {
+            Ok(()) => self.saved_settings = self.settings.clone(),
+            Err(e) => self.status = format!("Couldn't save settings: {e}"),
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             match self.cursor_world {
-                Some(c) => ui.monospace(format!("x {:>8.1}  y {:>8.1} mm", c.x, c.y)),
+                Some(c) => {
+                    let u = self.settings.units;
+                    ui.monospace(format!("x {:>8}  y {:>8}{}", u.number(c.x), u.number(c.y), u.suffix()))
+                }
                 None => ui.monospace(format!("{:>27}", "")),
             };
             ui.separator();
@@ -1786,10 +2299,34 @@ fn toggle_in<T: PartialEq>(list: &mut Vec<T>, item: T, toggle: bool) {
 
 /// Text on a translucent white plate, readable over the grid and fills.
 fn paint_label(painter: &egui::Painter, pos: Pos2, text: &str, color: Color32) {
-    let galley = painter.layout_no_wrap(text.to_owned(), FontId::monospace(12.0), color);
-    let rect = Align2::LEFT_CENTER.anchor_size(pos, galley.size());
-    painter.rect_filled(rect.expand(3.0), 3.0, Color32::from_white_alpha(220));
+    paint_label_at(painter, pos, Align2::LEFT_CENTER, 12.0, text, color);
+}
+
+fn paint_label_at(painter: &egui::Painter, pos: Pos2, anchor: Align2, size: f32, text: &str, color: Color32) {
+    let galley = painter.layout_no_wrap(text.to_owned(), FontId::monospace(size), color);
+    let rect = anchor.anchor_size(pos, galley.size());
+    painter.rect_filled(rect.expand(2.0), 3.0, Color32::from_white_alpha(200));
     painter.galley(rect.min, galley, color);
+}
+
+/// Drag field for a length stored in mm, shown and edited in `units`.
+fn length_value(
+    ui: &mut egui::Ui,
+    mm: &mut f64,
+    units: Units,
+    range_mm: std::ops::RangeInclusive<f64>,
+) -> egui::Response {
+    let mut v = units.display_value(*mm);
+    let resp = ui.add(
+        egui::DragValue::new(&mut v)
+            .speed(units.drag_speed())
+            .max_decimals(units.decimals() + 1)
+            .suffix(units.suffix()),
+    );
+    if resp.changed() {
+        *mm = units.to_mm(v).clamp(*range_mm.start(), *range_mm.end());
+    }
+    resp
 }
 
 /// Distinct, saturated color per seam so pairs are easy to tell apart.
@@ -1809,6 +2346,7 @@ fn seam_color(seam: usize) -> Color32 {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SESSION_KEY, &self.session());
+        self.save_settings();
     }
 
     /// Save often so a crash loses little work (the default is 30 s).
@@ -1821,7 +2359,17 @@ impl eframe::App for App {
         if ctx.input(|i| i.pointer.any_click()) {
             self.status.clear();
         }
-        self.handle_shortcuts(&ctx);
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+            if self.palette.is_open() {
+                self.palette.close();
+            } else {
+                self.palette.open();
+            }
+        }
+        // While the palette is open, keys belong to it.
+        if !self.palette.is_open() {
+            self.handle_shortcuts(&ctx);
+        }
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
@@ -1829,5 +2377,7 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
         });
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui));
+        self.settings_window(&ctx);
+        self.show_palette(&ctx);
     }
 }

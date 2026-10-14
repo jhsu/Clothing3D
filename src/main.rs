@@ -1,7 +1,10 @@
 mod app;
-mod model;
-mod sewing;
+mod palette;
+mod settings;
+mod units;
 mod view;
+
+use clothes3d_core::{curves, model, sewing};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

@@ -325,12 +325,23 @@ impl Pattern {
         // Walk from the fold's end point around to its start point, then
         // back through the mirrored interior points.
         let b = (k + m) % n;
-        let half: Vec<Point> = (0..=n - m).map(|j| p.points[(b + j) % n]).collect();
-        let mirrored = half[1..half.len() - 1]
-            .iter()
-            .rev()
-            .map(|pt| Point { pos: reflect(pt.pos, fa, fb), kind: pt.kind });
-        let points: Vec<Point> = half.iter().copied().chain(mirrored).collect();
+        let mut half: Vec<Point> = (0..=n - m).map(|j| p.points[(b + j) % n]).collect();
+        // Handles are offsets, so they reflect across the fold direction alone.
+        let dir = fb - fa;
+        let reflect_offset = |v: Vec2| reflect(v, Vec2::default(), dir);
+        // The mirrored half runs in reverse, so incoming and outgoing swap.
+        let mirrored = half[1..half.len() - 1].iter().rev().map(|pt| Point {
+            pos: reflect(pt.pos, fa, fb),
+            kind: pt.kind,
+            handle_in: pt.handle_out.map(reflect_offset),
+            handle_out: pt.handle_in.map(reflect_offset),
+        });
+        let mirrored: Vec<Point> = mirrored.collect();
+        // The fold ends now join their own mirror images.
+        let last = half.len() - 1;
+        half[0].handle_in = half[0].handle_out.map(reflect_offset);
+        half[last].handle_out = half[last].handle_in.map(reflect_offset);
+        let points: Vec<Point> = half.into_iter().chain(mirrored).collect();
 
         self.seams.retain(|s| {
             s.spans()
@@ -518,6 +529,23 @@ mod tests {
         assert_eq!(p.points.len(), 6); // interior fold points are dropped
         assert!((p.area().abs() - 20_000.0).abs() < 1e-9);
         assert_eq!(p.bounds(), Some((Vec2::new(0.0, 0.0), Vec2::new(200.0, 100.0))));
+    }
+
+    #[test]
+    fn unfold_mirrors_handles() {
+        let mut pat = pattern_with_seam();
+        pat.seams.clear();
+        // Bend the top edge (segment 2) upward, then unfold on the right edge.
+        let start = pat.pieces[0].segment_handles(2);
+        pat.pieces[0].bend_segment(2, 0.5, start, Vec2::new(0.0, 30.0));
+        let half_area = pat.pieces[0].area().abs();
+        assert_eq!(pat.unfold(0, &[1]), Ok(()));
+        let p = &pat.pieces[0];
+        assert!((p.area().abs() - 2.0 * half_area).abs() < 1e-6);
+        let (lo, hi) = p.bounds().unwrap();
+        // Symmetric about x = 100, with the bulge on both halves.
+        assert!(((lo.x + hi.x) / 2.0 - 100.0).abs() < 1e-6);
+        assert!(hi.y > 120.0);
     }
 
     #[test]

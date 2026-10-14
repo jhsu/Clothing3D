@@ -1,0 +1,11 @@
+[package]
+name = "clothes3d-core"
+description = "Platform-independent pattern model and sewing logic for clothes3d"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -8,6 +8,11 @@
 //!   (layer 3); curve points are smoothly interpolated by readers
 //! - internal lines, notches, grain lines, etc. will be added as extra
 //!   collections on `Piece`.
+//!
+//! Curved segments are cubic Béziers. A point's optional handles set the
+//! control points explicitly; where a handle is absent, curve points get an
+//! automatic smooth tangent (Catmull-Rom style) and turn points none. DXF-AAMA
+//! has no Béziers, so export will sample them into curve points.
 
 use serde::{Deserialize, Serialize};
 
@@ -62,15 +67,25 @@ pub enum PointKind {
     Curve,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub pos: Vec2,
     pub kind: PointKind,
+    /// Incoming Bézier handle, as an offset from `pos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_in: Option<Vec2>,
+    /// Outgoing Bézier handle, as an offset from `pos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_out: Option<Vec2>,
 }
 
 impl Point {
     pub fn turn(pos: Vec2) -> Self {
-        Self { pos, kind: PointKind::Turn }
+        Self { pos, ..Self::default() }
+    }
+
+    pub fn has_handles(&self) -> bool {
+        self.handle_in.is_some() || self.handle_out.is_some()
     }
 }
 
@@ -82,7 +97,7 @@ pub struct Piece {
 }
 
 /// Number of samples used to flatten one curved segment.
-const CURVE_SAMPLES: usize = 16;
+const CURVE_SAMPLES: usize = 32;
 
 impl Piece {
     pub fn new(name: impl Into<String>) -> Self {
@@ -98,7 +113,7 @@ impl Piece {
     }
 
     /// Index of the point following `i`, honoring closure.
-    fn next(&self, i: usize) -> Option<usize> {
+    pub fn next(&self, i: usize) -> Option<usize> {
         let n = self.points.len();
         if i + 1 < n {
             Some(i + 1)
@@ -109,7 +124,7 @@ impl Piece {
         }
     }
 
-    fn prev(&self, i: usize) -> Option<usize> {
+    pub fn prev(&self, i: usize) -> Option<usize> {
         let n = self.points.len();
         if i > 0 {
             Some(i - 1)
@@ -120,9 +135,9 @@ impl Piece {
         }
     }
 
-    /// Tangent at point `i` for Hermite interpolation. Turn points have a
-    /// zero tangent, so a segment between two turn points is a straight line.
-    fn tangent(&self, i: usize) -> Vec2 {
+    /// Automatic tangent at point `i` (Catmull-Rom). Turn points have a zero
+    /// tangent, so a segment between two turn points is a straight line.
+    pub(crate) fn auto_tangent(&self, i: usize) -> Vec2 {
         let p = &self.points[i];
         if p.kind == PointKind::Turn {
             return Vec2::default();
@@ -134,7 +149,29 @@ impl Piece {
 
     pub fn segment_is_curved(&self, seg: usize) -> bool {
         let Some(b) = self.next(seg) else { return false };
-        self.points[seg].kind == PointKind::Curve || self.points[b].kind == PointKind::Curve
+        let (pa, pb) = (&self.points[seg], &self.points[b]);
+        pa.kind == PointKind::Curve
+            || pb.kind == PointKind::Curve
+            || pa.handle_out.is_some()
+            || pb.handle_in.is_some()
+    }
+
+    /// Effective outgoing handle of point `i`: explicit, else the automatic
+    /// one for curve points (a third of the tangent, Hermite-equivalent).
+    pub fn out_handle(&self, i: usize) -> Vec2 {
+        self.points[i].handle_out.unwrap_or_else(|| self.auto_tangent(i) * (1.0 / 3.0))
+    }
+
+    /// Effective incoming handle of point `i` (see [`Self::out_handle`]).
+    pub fn in_handle(&self, i: usize) -> Vec2 {
+        self.points[i].handle_in.unwrap_or_else(|| self.auto_tangent(i) * (-1.0 / 3.0))
+    }
+
+    /// Absolute Bézier points `[p0, c0, c1, p1]` of segment `seg`.
+    pub fn segment_bezier(&self, seg: usize) -> [Vec2; 4] {
+        let b = self.next(seg).expect("segment index out of range");
+        let (p0, p1) = (self.points[seg].pos, self.points[b].pos);
+        [p0, p0 + self.out_handle(seg), p1 + self.in_handle(b), p1]
     }
 
     /// Evaluate segment `seg` (from point `seg` to the next) at `t` in [0, 1].
@@ -144,13 +181,9 @@ impl Piece {
         if !self.segment_is_curved(seg) {
             return p0.lerp(p1, t);
         }
-        let (m0, m1) = (self.tangent(seg), self.tangent(b));
-        let (t2, t3) = (t * t, t * t * t);
-        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-        let h10 = t3 - 2.0 * t2 + t;
-        let h01 = -2.0 * t3 + 3.0 * t2;
-        let h11 = t3 - t2;
-        p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11
+        let [_, c0, c1, _] = self.segment_bezier(seg);
+        let u = 1.0 - t;
+        p0 * (u * u * u) + c0 * (3.0 * u * u * t) + c1 * (3.0 * u * t * t) + p1 * (t * t * t)
     }
 
     /// Sampled polyline for one segment, including both endpoints.
@@ -196,11 +229,33 @@ impl Piece {
     }
 
     /// Insert a point on segment `seg` at parameter `t`. Returns its index.
+    /// A segment with handles is split exactly (de Casteljau), so its shape
+    /// is unchanged; the halves keep the original parameterization.
     pub fn insert_on_segment(&mut self, seg: usize, t: f64) -> usize {
         let pos = self.eval_segment(seg, t);
-        let kind = if self.segment_is_curved(seg) { PointKind::Curve } else { PointKind::Turn };
         let idx = seg + 1;
-        self.points.insert(idx, Point { pos, kind });
+        let (a, b) = self.segment_ends(seg);
+        if self.points[a].handle_out.is_none() && self.points[b].handle_in.is_none() {
+            let kind = if self.segment_is_curved(seg) { PointKind::Curve } else { PointKind::Turn };
+            self.points.insert(idx, Point { pos, kind, ..Point::default() });
+            return idx;
+        }
+        // Freeze automatic handles at both ends: their tangents depend on the
+        // neighbors, which are about to change.
+        self.materialize_handles(a);
+        self.materialize_handles(b);
+        let [p0, c0, c1, p1] = self.segment_bezier(seg);
+        let (q0, q1, q2) = (p0.lerp(c0, t), c0.lerp(c1, t), c1.lerp(p1, t));
+        let (r0, r1) = (q0.lerp(q1, t), q1.lerp(q2, t));
+        self.points[a].handle_out = Some(q0 - p0);
+        self.points[b].handle_in = Some(q2 - p1);
+        let mid = Point {
+            pos,
+            kind: PointKind::Curve,
+            handle_in: Some(r0 - pos),
+            handle_out: Some(r1 - pos),
+        };
+        self.points.insert(idx, mid);
         idx
     }
 
@@ -258,21 +313,22 @@ impl Piece {
     pub fn rotate(&mut self, degrees: f64) {
         let c = self.center();
         let (sin, cos) = degrees.to_radians().sin_cos();
+        let rot = |d: Vec2| Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos);
         for p in &mut self.points {
-            let d = p.pos - c;
-            p.pos = c + Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos);
+            p.pos = c + rot(p.pos - c);
+            p.handle_in = p.handle_in.map(rot);
+            p.handle_out = p.handle_out.map(rot);
         }
     }
 
     /// Mirror left-right (`horizontal`) or top-bottom about the bounding-box center.
     pub fn flip(&mut self, horizontal: bool) {
         let c = self.center();
+        let mirror = |v: Vec2| if horizontal { Vec2::new(-v.x, v.y) } else { Vec2::new(v.x, -v.y) };
         for p in &mut self.points {
-            if horizontal {
-                p.pos.x = 2.0 * c.x - p.pos.x;
-            } else {
-                p.pos.y = 2.0 * c.y - p.pos.y;
-            }
+            p.pos = c + mirror(p.pos - c);
+            p.handle_in = p.handle_in.map(mirror);
+            p.handle_out = p.handle_out.map(mirror);
         }
     }
 

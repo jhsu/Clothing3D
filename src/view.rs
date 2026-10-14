@@ -60,15 +60,6 @@ impl View {
         let zy = f64::from(rect.height()) / size.y.max(1.0);
         self.zoom = (zx.min(zy) * 0.85).clamp(MIN_ZOOM, MAX_ZOOM);
     }
-
-    /// Grid spacing in mm: smallest power of ten that is at least `min_px` wide.
-    pub fn grid_step(&self, min_px: f64) -> f64 {
-        let mut step = 1.0;
-        while step * self.zoom < min_px {
-            step *= 10.0;
-        }
-        step
-    }
 }
 
 #[cfg(test)]
