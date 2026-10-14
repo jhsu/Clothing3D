@@ -26,6 +26,7 @@ they're saved to `$XDG_CONFIG_HOME/clothes3d/settings.json`
 
 | Action | Input |
 |---|---|
+| Hint bar | The bottom bar shows what clicks and keys do right now for the current tool and step (e.g. while sewing or typing a length); status messages replace it until the next click. On the right, GRID / SNAP / LENGTHS / SA toggle grid snap, point snap, length labels and seam allowance, and the units chip switches mm / in |
 | Command palette | Ctrl+K — fuzzy-find any tool or command (↑/↓ to pick, Enter to run, Esc to close). Commands that need a selection are shown greyed out |
 | Segment length labels | L (or View → Segment lengths) — label every segment with its length |
 | Units | View → Units, Settings, or the palette: millimetres or inches. Typed lengths use the current unit and accept fractions (`3 1/2`, `3/8`); the grid switches to inch steps. Inch lengths show as fractions to 1/16 by default; Settings → Inch lengths picks 1/8, 1/32 or decimals |

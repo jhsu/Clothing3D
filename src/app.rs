@@ -46,7 +46,8 @@ impl Tool {
         }
     }
 
-    fn hint(self) -> &'static str {
+    /// Longer help, shown on the tool's button.
+    fn help(self) -> &'static str {
         match self {
             Tool::Select => {
                 "Click a point or edge to select (Shift+click for several), or drag a box on empty \
@@ -1308,18 +1309,6 @@ impl App {
         Some((EdgeSpan::shortest(&self.pattern.pieces, pi, start, at), false))
     }
 
-    fn sew_hint(&self) -> &'static str {
-        match self.sew {
-            SewState::Idle => Tool::Sew.hint(),
-            SewState::FirstStart(..) => "Click the end of the first edge segment (Esc cancels)",
-            SewState::First(_) => "Click the start of the matching edge segment",
-            SewState::SecondStart(..) => {
-                "Click the end of the matching edge segment. Diamonds mark the matching length \
-                 (hold Alt to place freely)"
-            }
-        }
-    }
-
     // -------------------------------------------------------------- painting
 
     fn paint(&self, vi: usize, painter: &egui::Painter, proj: Projection, hover: Option<Pos2>) {
@@ -2197,7 +2186,7 @@ impl App {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Tools");
         for tool in [Tool::Select, Tool::Draw, Tool::AddPoint, Tool::Curve, Tool::Sew] {
-            if ui.selectable_label(self.tool == tool, tool.label()).clicked() {
+            if ui.selectable_label(self.tool == tool, tool.label()).on_hover_text(tool.help()).clicked() {
                 self.set_tool(tool);
             }
         }
@@ -2802,32 +2791,120 @@ impl App {
         }
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            match self.cursor_world {
-                Some(c) => {
-                    let u = self.settings.lengths();
-                    ui.monospace(format!("x {:>8}  y {:>8}{}", u.number(c.x), u.number(c.y), u.suffix()))
+    /// What clicks and keys do right now, for the hint bar: `(keys, action)`.
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.length_input_active() && !self.length_input.is_empty() {
+            let enter = if self.tool == Tool::Draw { "Place point" } else { "Set length" };
+            return vec![("Enter", enter), ("Backspace", "Delete digit"), ("Esc", "Cancel")];
+        }
+        match self.dragging {
+            Some(Drag::Handle { .. }) => return vec![("Alt", "Break smooth point into a corner")],
+            Some(Drag::Marquee { .. }) => return vec![("Release", "Select points inside")],
+            Some(Drag::Points { .. } | Drag::Piece { .. }) => return vec![("G", "Grid snap on/off")],
+            Some(Drag::Bend { .. }) | None => {}
+        }
+        let mut hints = match self.tool {
+            Tool::Select => {
+                let mut h = vec![("Click", "Select"), ("Shift", "Add to selection"), ("Drag", "Move")];
+                if self.single_segment().is_some() {
+                    h.insert(0, ("0–9", "Type length"));
+                } else {
+                    h.push(("Ctrl drag", "Box select"));
                 }
-                None => ui.monospace(format!("{:>27}", "")),
-            };
-            ui.separator();
-            if let Some(view) = self.viewports[self.active_viewport].camera() {
-                ui.monospace(format!("zoom {:.0}%", view.zoom * 100.0));
+                if self.selected_piece.is_some() {
+                    h.extend([("Arrows", "Nudge"), ("R", "Rotate"), ("H", "Flip")]);
+                }
+                h.push(("Double-click", "Insert point"));
+                h
             }
-            ui.separator();
-            if let Some(server) = &self.mcp {
-                ui.weak("MCP").on_hover_text(format!("AI agents can connect at {}", server.url()));
+            Tool::Draw if self.drawing.is_some() => vec![
+                ("Click", "Place point"),
+                ("0–9", "Type length"),
+                ("Enter", "Close piece"),
+                ("Esc", "Stop"),
+            ],
+            Tool::Draw => vec![("Click", "Place first point")],
+            Tool::AddPoint => vec![("Click outline", "Insert point")],
+            Tool::Curve => vec![
+                ("Drag edge", "Bend"),
+                ("Double-click", "Straighten"),
+                ("Drag handle", "Shape"),
+                ("Alt", "Break smooth point"),
+            ],
+            Tool::Sew => match self.sew {
+                SewState::Idle => vec![("Click edge", "Start of first edge")],
+                SewState::FirstStart(..) => vec![("Click", "End of first edge"), ("Esc", "Cancel")],
+                SewState::First(_) => vec![("Click edge", "Start of matching edge"), ("Esc", "Cancel")],
+                SewState::SecondStart(..) => {
+                    let mut h = vec![("Click", "End of matching edge")];
+                    if self.settings.snap_match {
+                        h.push(("Alt", "Place freely"));
+                    }
+                    h.push(("Esc", "Cancel"));
+                    h
+                }
+            },
+        };
+        hints.push(("Ctrl K", "Commands"));
+        hints
+    }
+
+    /// Bottom bar: hints (or the latest status message) on the left; display
+    /// toggles, units, cursor position and zoom on the right.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(view) = self.viewports[self.active_viewport].camera() {
+                    ui.label(egui::RichText::new(format!("{:.0}%", view.zoom * 100.0)).monospace().color(theme::MUTED))
+                        .on_hover_text("Zoom");
+                }
+                if let Some(c) = self.cursor_world {
+                    let u = self.settings.lengths();
+                    let text = format!("x {}  y {}", u.number(c.x), u.number(c.y));
+                    ui.label(egui::RichText::new(text).monospace().color(theme::MUTED));
+                }
+                let units = match self.settings.units {
+                    Units::Millimeters => "mm",
+                    Units::Inches => "in",
+                };
+                if toggle_chip(ui, units, false).on_hover_text("Units: click to switch").clicked() {
+                    self.settings.toggle_units();
+                }
                 ui.separator();
-            } else if let Some(e) = &self.mcp_error {
-                ui.colored_label(ui.visuals().warn_fg_color, "MCP off").on_hover_text(e);
+                let s = &mut self.settings;
+                for (label, on, tip) in [
+                    ("SA", &mut s.show_allowance, "Show seam allowance"),
+                    ("LENGTHS", &mut s.show_lengths, "Label segment lengths (L)"),
+                    ("SNAP", &mut s.snap_points, "Snap to points"),
+                    ("GRID", &mut s.snap_grid, "Snap to grid (G)"),
+                ] {
+                    if toggle_chip(ui, label, *on).on_hover_text(tip).clicked() {
+                        *on = !*on;
+                    }
+                }
+                if let Some(server) = &self.mcp {
+                    ui.separator();
+                    ui.label(egui::RichText::new("MCP").color(theme::MUTED))
+                        .on_hover_text(format!("AI agents can connect at {}", server.url()));
+                } else if let Some(e) = &self.mcp_error {
+                    ui.separator();
+                    ui.colored_label(theme::WARN, "MCP off").on_hover_text(e);
+                }
                 ui.separator();
-            }
-            if self.status.is_empty() {
-                ui.label(if self.tool == Tool::Sew { self.sew_hint() } else { self.tool.hint() });
-            } else {
-                ui.label(&self.status);
-            }
+                // The rest of the bar, left to right.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if !self.status.is_empty() {
+                        ui.label(&self.status);
+                        return;
+                    }
+                    for (keys, action) in self.hints() {
+                        key_cap(ui, keys);
+                        ui.label(action);
+                        ui.add_space(6.0);
+                    }
+                });
+            });
         });
     }
 }
@@ -2844,6 +2921,29 @@ fn toggle_in<T: PartialEq>(list: &mut Vec<T>, item: T, toggle: bool) {
 }
 
 /// Text on a translucent white plate, readable over the grid and fills.
+/// A key or mouse action drawn as a key cap, for the hint bar.
+fn key_cap(ui: &mut egui::Ui, keys: &str) {
+    egui::Frame::new()
+        .fill(theme::PAPER)
+        .stroke(Stroke::new(1.0, theme::CUT_LINE))
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(5, 0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(keys).size(11.0).strong().color(theme::INK));
+        });
+}
+
+/// Small caps chip for a display toggle: blue while on.
+fn toggle_chip(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+    let (fill, text) = if on {
+        (theme::ACCENT.gamma_multiply(0.12), theme::ACCENT)
+    } else {
+        (Color32::TRANSPARENT, theme::MUTED)
+    };
+    let text = egui::RichText::new(label).size(10.5).strong().extra_letter_spacing(0.8).color(text);
+    ui.add(egui::Button::new(text).fill(fill).stroke(Stroke::NONE).corner_radius(3.0))
+}
+
 /// A point marker: a diamond for a corner, a circle for a smooth point.
 fn paint_point(painter: &egui::Painter, at: Pos2, kind: PointKind, size: f32, fill: Color32, stroke: Stroke) {
     match kind {
@@ -3052,6 +3152,34 @@ mod tests {
         restored.restore(ron::from_str(&text).unwrap());
         assert_eq!(restored.viewports.len(), 2);
         assert_eq!(restored.active_viewport, 1);
+    }
+
+    fn keys(app: &App) -> Vec<&'static str> {
+        app.hints().into_iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn hints_follow_the_sewing_steps() {
+        let mut app = App { tool: Tool::Sew, ..App::default() };
+        assert_eq!(app.hints()[0].1, "Start of first edge");
+        let at = OutlinePos::new(0, 0.0);
+        app.sew = SewState::FirstStart(0, at);
+        assert_eq!(keys(&app), ["Click", "Esc", "Ctrl K"]);
+        let a = EdgeSpan { piece: 0, start: at, end: OutlinePos::new(1, 0.0), forward: true };
+        app.sew = SewState::SecondStart(a, 1, at);
+        assert_eq!(keys(&app), ["Click", "Alt", "Esc", "Ctrl K"]);
+        // Alt only bypasses the length snap, so it isn't offered without it.
+        app.settings.snap_match = false;
+        assert_eq!(keys(&app), ["Click", "Esc", "Ctrl K"]);
+    }
+
+    #[test]
+    fn hints_while_typing_a_length() {
+        let mut app = App { tool: Tool::Select, ..App::default() };
+        app.selected_segments = vec![(0, 0)];
+        assert_eq!(keys(&app)[0], "0–9");
+        app.length_input = "3 1/2".into();
+        assert_eq!(app.hints(), [("Enter", "Set length"), ("Backspace", "Delete digit"), ("Esc", "Cancel")]);
     }
 
     #[test]

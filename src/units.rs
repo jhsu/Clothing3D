@@ -202,10 +202,6 @@ impl Lengths {
         self.number(self.units.to_mm(v))
     }
 
-    pub fn suffix(self) -> &'static str {
-        self.units.suffix()
-    }
-
     pub fn parse(self, s: &str) -> Option<f64> {
         self.units.parse(s)
     }
