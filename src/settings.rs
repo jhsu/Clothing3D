@@ -14,6 +14,10 @@ pub struct Settings {
     pub units: Units,
     /// Label every segment with its length.
     pub show_lengths: bool,
+    /// Draw the cut line and allowance band around pieces with seam allowance.
+    pub show_allowance: bool,
+    /// Seam allowance (mm) given to a piece by "Add seam allowance".
+    pub seam_allowance: f64,
     pub snap_grid: bool,
     /// Grid snap step, mm.
     pub snap_step: f64,
@@ -37,6 +41,8 @@ impl Default for Settings {
         Self {
             units: Units::Millimeters,
             show_lengths: false,
+            show_allowance: true,
+            seam_allowance: 10.0,
             snap_grid: true,
             snap_step: 10.0,
             snap_points: true,

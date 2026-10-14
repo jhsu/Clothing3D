@@ -61,6 +61,7 @@ pub fn piece_summary(f: Fmt, pattern: &Pattern, i: usize) -> Value {
         "segments": p.segment_count(),
         "perimeter": f.len(p.perimeter()),
         "area": if p.closed { f.area(p.area().abs()) } else { 0.0 },
+        "seam_allowance": f.len(p.seam_allowance),
         "bounds": bounds(f, p),
     })
 }
@@ -91,13 +92,18 @@ pub fn piece_detail(f: Fmt, pattern: &Pattern, i: usize) -> Value {
     let segments: Vec<Value> = (0..p.segment_count())
         .map(|s| {
             let (a, b) = p.segment_ends(s);
-            json!({
+            let mut v = json!({
                 "index": s,
                 "from": a,
                 "to": b,
                 "length": f.len(p.segment_length(s)),
                 "curved": p.segment_is_curved(s),
-            })
+                "allowance": f.len(p.segment_allowance(s)),
+            });
+            if p.points[s].allowance.is_some() {
+                v["own_allowance"] = true.into();
+            }
+            v
         })
         .collect();
     let mut v = piece_summary(f, pattern, i);
@@ -150,6 +156,11 @@ pub fn overview(f: Fmt, pattern: &Pattern, tolerance: f64) -> Value {
         "seam_tolerance": f.len(tolerance),
         "pieces": (0..pattern.pieces.len()).map(|i| piece_summary(f, pattern, i)).collect::<Vec<_>>(),
         "seams": (0..pattern.seams.len()).map(|i| seam(f, pattern, i, tolerance)).collect::<Vec<_>>(),
+        // Edits to one side of a link are mirrored onto the other.
+        "symmetries": pattern.symmetries.iter().map(|s| json!({
+            "pieces": if s.is_halves() { vec![s.a] } else { vec![s.a, s.b] },
+            "kind": if s.is_halves() { "halves" } else if s.axis().is_some() { "mirrored pieces" } else { "linked copies" },
+        })).collect::<Vec<_>>(),
     })
 }
 

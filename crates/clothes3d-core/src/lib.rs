@@ -2,7 +2,9 @@
 //! sewing logic. No I/O or UI dependencies, so it builds for native and
 //! `wasm32-unknown-unknown` alike.
 
+pub mod allowance;
 pub mod curves;
 pub mod dxf;
 pub mod model;
 pub mod sewing;
+pub mod symmetry;

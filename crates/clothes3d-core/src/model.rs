@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sewing::Seam;
+use crate::symmetry::Symmetry;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec2 {
@@ -58,6 +59,84 @@ impl std::ops::Mul<f64> for Vec2 {
     }
 }
 
+/// A distance-preserving map `p ↦ m·p + t`: a rotation or a reflection, plus
+/// a translation. `x` and `y` are the columns of `m`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Isometry {
+    pub x: Vec2,
+    pub y: Vec2,
+    pub t: Vec2,
+}
+
+impl Default for Isometry {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Isometry {
+    pub const IDENTITY: Self = Self { x: Vec2::new(1.0, 0.0), y: Vec2::new(0.0, 1.0), t: Vec2::new(0.0, 0.0) };
+
+    pub fn translation(d: Vec2) -> Self {
+        Self { t: d, ..Self::IDENTITY }
+    }
+
+    /// Counter-clockwise rotation by `degrees` about `c`.
+    pub fn rotation(c: Vec2, degrees: f64) -> Self {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        Self { x: Vec2::new(cos, sin), y: Vec2::new(-sin, cos), t: Vec2::default() }.fixing(c)
+    }
+
+    /// Reflection across the line through `a` and `b`.
+    pub fn mirror(a: Vec2, b: Vec2) -> Self {
+        let d = b - a;
+        let len2 = d.dot(d);
+        if len2 == 0.0 {
+            return Self::IDENTITY;
+        }
+        // Columns of the reflection matrix: (cos 2θ, sin 2θ) and (sin 2θ, -cos 2θ).
+        let (cos, sin) = ((d.x * d.x - d.y * d.y) / len2, 2.0 * d.x * d.y / len2);
+        Self { x: Vec2::new(cos, sin), y: Vec2::new(sin, -cos), t: Vec2::default() }.fixing(a)
+    }
+
+    /// The same linear part, translated so that `c` maps to itself.
+    fn fixing(self, c: Vec2) -> Self {
+        Self { t: c - self.linear(c), ..self }
+    }
+
+    /// Apply to an offset (such as a Bézier handle): rotation/reflection only.
+    pub fn linear(&self, v: Vec2) -> Vec2 {
+        self.x * v.x + self.y * v.y
+    }
+
+    pub fn apply(&self, p: Vec2) -> Vec2 {
+        self.linear(p) + self.t
+    }
+
+    /// This map followed by `next`.
+    pub fn then(&self, next: &Self) -> Self {
+        Self { x: next.linear(self.x), y: next.linear(self.y), t: next.apply(self.t) }
+    }
+
+    pub fn inverse(&self) -> Self {
+        // The linear part is orthogonal, so its inverse is its transpose.
+        let m = Self { x: Vec2::new(self.x.x, self.y.x), y: Vec2::new(self.x.y, self.y.y), t: Vec2::default() };
+        Self { t: m.linear(self.t) * -1.0, ..m }
+    }
+
+    /// The mirror line `(point, unit direction)` of a reflection, ignoring
+    /// any slide along it; `None` for rotations and translations.
+    pub fn mirror_line(&self) -> Option<(Vec2, Vec2)> {
+        if self.x.x * self.y.y - self.y.x * self.x.y >= 0.0 {
+            return None;
+        }
+        let angle = self.x.y.atan2(self.x.x) / 2.0;
+        let dir = Vec2::new(angle.cos(), angle.sin());
+        let slide = self.t.dot(dir);
+        Some(((self.t - dir * slide) * 0.5, dir))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PointKind {
     /// Sharp corner (AAMA "turn point").
@@ -77,6 +156,10 @@ pub struct Point {
     /// Outgoing Bézier handle, as an offset from `pos`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle_out: Option<Vec2>,
+    /// Seam allowance (mm) of the segment starting at this point, overriding
+    /// the piece's default. `Some(0.0)` means no allowance on that segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowance: Option<f64>,
 }
 
 impl Point {
@@ -94,6 +177,13 @@ pub struct Piece {
     pub name: String,
     pub points: Vec<Point>,
     pub closed: bool,
+    /// Default seam allowance (mm) for segments without their own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seam_allowance: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Number of samples used to flatten one curved segment.
@@ -101,7 +191,7 @@ const CURVE_SAMPLES: usize = 32;
 
 impl Piece {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), points: Vec::new(), closed: false }
+        Self { name: name.into(), points: Vec::new(), closed: false, seam_allowance: 0.0 }
     }
 
     pub fn segment_count(&self) -> usize {
@@ -235,9 +325,11 @@ impl Piece {
         let pos = self.eval_segment(seg, t);
         let idx = seg + 1;
         let (a, b) = self.segment_ends(seg);
+        // Both halves keep the split segment's allowance.
+        let allowance = self.points[a].allowance;
         if self.points[a].handle_out.is_none() && self.points[b].handle_in.is_none() {
             let kind = if self.segment_is_curved(seg) { PointKind::Curve } else { PointKind::Turn };
-            self.points.insert(idx, Point { pos, kind, ..Point::default() });
+            self.points.insert(idx, Point { pos, kind, allowance, ..Point::default() });
             return idx;
         }
         // Freeze automatic handles at both ends: their tangents depend on the
@@ -254,6 +346,7 @@ impl Piece {
             kind: PointKind::Curve,
             handle_in: Some(r0 - pos),
             handle_out: Some(r1 - pos),
+            allowance,
         };
         self.points.insert(idx, mid);
         idx
@@ -309,27 +402,35 @@ impl Piece {
         self.bounds().map_or_else(Vec2::default, |(lo, hi)| lo.lerp(hi, 0.5))
     }
 
+    /// Move every point (and turn its handles) by `iso`.
+    pub fn transform(&mut self, iso: &Isometry) {
+        for p in &mut self.points {
+            p.pos = iso.apply(p.pos);
+            p.handle_in = p.handle_in.map(|h| iso.linear(h));
+            p.handle_out = p.handle_out.map(|h| iso.linear(h));
+        }
+    }
+
+    /// Counter-clockwise rotation by `degrees` about the bounding-box center.
+    pub fn rotation(&self, degrees: f64) -> Isometry {
+        Isometry::rotation(self.center(), degrees)
+    }
+
+    /// Left-right (`horizontal`) or top-bottom mirror about the bounding-box center.
+    pub fn flipping(&self, horizontal: bool) -> Isometry {
+        let c = self.center();
+        let along = if horizontal { Vec2::new(0.0, 1.0) } else { Vec2::new(1.0, 0.0) };
+        Isometry::mirror(c, c + along)
+    }
+
     /// Rotate counter-clockwise by `degrees` about the bounding-box center.
     pub fn rotate(&mut self, degrees: f64) {
-        let c = self.center();
-        let (sin, cos) = degrees.to_radians().sin_cos();
-        let rot = |d: Vec2| Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos);
-        for p in &mut self.points {
-            p.pos = c + rot(p.pos - c);
-            p.handle_in = p.handle_in.map(rot);
-            p.handle_out = p.handle_out.map(rot);
-        }
+        self.transform(&self.rotation(degrees));
     }
 
     /// Mirror left-right (`horizontal`) or top-bottom about the bounding-box center.
     pub fn flip(&mut self, horizontal: bool) {
-        let c = self.center();
-        let mirror = |v: Vec2| if horizontal { Vec2::new(-v.x, v.y) } else { Vec2::new(v.x, -v.y) };
-        for p in &mut self.points {
-            p.pos = c + mirror(p.pos - c);
-            p.handle_in = p.handle_in.map(mirror);
-            p.handle_out = p.handle_out.map(mirror);
-        }
+        self.transform(&self.flipping(horizontal));
     }
 
     /// End point indices `(start, end)` of segment `seg`.
@@ -460,6 +561,9 @@ pub struct Pattern {
     pub pieces: Vec<Piece>,
     #[serde(default)]
     pub seams: Vec<Seam>,
+    /// Pieces and halves of pieces edited as mirror images of each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symmetries: Vec<Symmetry>,
 }
 
 #[cfg(test)]

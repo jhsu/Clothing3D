@@ -56,7 +56,8 @@ they're saved to `$XDG_CONFIG_HOME/clothes3d/settings.json`
 | Toggle grid snap | G |
 | Undo / Redo | Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y |
 | Open / Save | Ctrl+O / Ctrl+S (JSON) |
-| Export DXF (AAMA/ASTM) | File → Export DXF… (or the command palette) |
+| Seam allowance | Outlines are sew lines; allowance adds a cut line outside them. Select a closed piece and click **Add** next to "Seam allowance" (default width in Settings), then type or drag to change it for the whole piece. Give a segment its own width in the Segments list's Allowance column (0 for none, e.g. on a fold; ↺ returns it to the piece's), or select several segments and set them together. View → Seam allowance hides the cut line |
+| Export DXF (AAMA/ASTM) | File → Export DXF… (or the command palette) — pieces with seam allowance export the cut line on layer 1 and the sew line on layer 14 |
 
 ## AI agents (MCP)
 
@@ -123,6 +124,10 @@ style name (the file name) and `Units: METRIC` (coordinates in mm).
 Curved (Bézier) segments are densified: the sampled in-between vertices sit
 on the boundary without a turn/curve marker. Open pieces are skipped and
 listed in the status bar.
+
+For a piece with seam allowance, the boundary on layer 1 is the cut line,
+with its corners (turns over 10°) as turn points, and the outline goes on
+layer 14 as the sew line.
 
 #### Known shortcomings
 

@@ -5,6 +5,11 @@
 //! - layer 1: boundary POLYLINE, plus "Piece Name" / "Quantity" TEXT
 //! - layer 2: turn points (POINT)
 //! - layer 3: curve points (POINT)
+//! - layer 14: sew line POLYLINE, for pieces with seam allowance
+//!
+//! Without seam allowance the boundary is the outline. With it, the boundary
+//! is the cut line and the outline goes on layer 14; the cut line's corners
+//! (where it turns by more than [`CORNER_DEGREES`]) are its turn points.
 //!
 //! Bézier segments can't be expressed directly, so curved segments are
 //! densified: their sampled interior vertices go on the boundary polyline
@@ -12,7 +17,7 @@
 //! Y up) and declared with `Units: METRIC`.
 //!
 //! Not yet exported: seams (AAMA has no seam concept), notches, grain lines,
-//! internal lines, seam allowance, grading.
+//! internal lines, grading.
 
 use std::collections::HashSet;
 use std::fmt::{Display, Write};
@@ -23,6 +28,10 @@ use crate::model::{Pattern, Piece, PointKind, Vec2};
 
 /// Height of annotation text, in mm.
 const TEXT_HEIGHT: f64 = 5.0;
+/// A cut-line vertex turning by more than this is exported as a turn point.
+const CORNER_DEGREES: f64 = 10.0;
+/// Layers declared in the LAYER table.
+const LAYERS: [u8; 4] = [1, 2, 3, 14];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DxfExport {
@@ -55,8 +64,8 @@ pub fn export_aama(pattern: &Pattern, style_name: &str) -> DxfExport {
     w.section("TABLES");
     w.pair(0, "TABLE");
     w.pair(2, "LAYER");
-    w.pair(70, 3);
-    for layer in 1..=3 {
+    w.pair(70, LAYERS.len());
+    for layer in LAYERS {
         w.pair(0, "LAYER");
         w.pair(2, layer);
         w.pair(70, 0);
@@ -142,6 +151,20 @@ fn boundary(piece: &Piece) -> Vec<(Vec2, Option<PointKind>)> {
     out
 }
 
+/// Cut-line vertices (no repeated closing vertex); corners are turn points.
+fn cut_boundary(cut: &[Vec2]) -> Vec<(Vec2, Option<PointKind>)> {
+    let pts = &cut[..cut.len() - 1];
+    let n = pts.len();
+    let min_cos = CORNER_DEGREES.to_radians().cos();
+    (0..n)
+        .map(|i| {
+            let (a, b) = (pts[i] - pts[(i + n - 1) % n], pts[(i + 1) % n] - pts[i]);
+            let cos = a.dot(b) / (a.length() * b.length()).max(1e-12);
+            (pts[i], (cos < min_cos).then_some(PointKind::Turn))
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct DxfWriter {
     out: String,
@@ -184,6 +207,22 @@ impl DxfWriter {
         self.pair(1, escape_text(s));
     }
 
+    /// A closed POLYLINE on `layer`.
+    fn polyline(&mut self, layer: u8, pts: impl Iterator<Item = Vec2>) {
+        self.pair(0, "POLYLINE");
+        self.pair(8, layer);
+        self.pair(66, 1);
+        self.point(10, Vec2::default());
+        self.pair(70, 1); // closed
+        for p in pts {
+            self.pair(0, "VERTEX");
+            self.pair(8, layer);
+            self.point(10, p);
+        }
+        self.pair(0, "SEQEND");
+        self.pair(8, layer);
+    }
+
     fn piece_block(&mut self, piece: &Piece, name: &str) {
         self.pair(0, "BLOCK");
         self.pair(8, 1);
@@ -192,19 +231,12 @@ impl DxfWriter {
         self.point(10, Vec2::default());
         self.pair(3, name);
 
-        let verts = boundary(piece);
-        self.pair(0, "POLYLINE");
-        self.pair(8, 1);
-        self.pair(66, 1);
-        self.point(10, Vec2::default());
-        self.pair(70, 1); // closed
-        for &(p, _) in &verts {
-            self.pair(0, "VERTEX");
-            self.pair(8, 1);
-            self.point(10, p);
+        let cut = piece.cut_line();
+        let verts = if cut.is_empty() { boundary(piece) } else { cut_boundary(&cut) };
+        self.polyline(1, verts.iter().map(|&(p, _)| p));
+        if !cut.is_empty() {
+            self.polyline(14, boundary(piece).into_iter().map(|(p, _)| p));
         }
-        self.pair(0, "SEQEND");
-        self.pair(8, 1);
 
         for &(p, kind) in &verts {
             let layer = match kind {
@@ -263,7 +295,7 @@ mod tests {
 
     #[test]
     fn square_structure() {
-        let pattern = Pattern { pieces: vec![square("Front", 0.0)], seams: vec![] };
+        let pattern = Pattern { pieces: vec![square("Front", 0.0)], seams: vec![], ..Default::default() };
         let out = export_aama(&pattern, "Test");
         assert!(out.skipped.is_empty());
         assert!(out.text.contains("\r\n"));
@@ -290,7 +322,7 @@ mod tests {
     fn curves_are_densified_and_marked() {
         let mut piece = square("Curvy", 0.0);
         piece.points[1].kind = PointKind::Curve;
-        let pattern = Pattern { pieces: vec![piece.clone()], seams: vec![] };
+        let pattern = Pattern { pieces: vec![piece.clone()], seams: vec![], ..Default::default() };
         let p = pairs(&export_aama(&pattern, "S").text);
         let verts = entities(&p, "VERTEX");
         // Segments 0 and 1 touch the curve point and are sampled.
@@ -306,12 +338,42 @@ mod tests {
     }
 
     #[test]
+    fn seam_allowance_cut_and_sew_lines() {
+        let mut piece = square("Front", 0.0);
+        piece.seam_allowance = 10.0;
+        let pattern = Pattern { pieces: vec![piece], seams: vec![], ..Default::default() };
+        let p = pairs(&export_aama(&pattern, "S").text);
+        let polylines = entities(&p, "POLYLINE");
+        let layers: Vec<&str> = polylines.iter().map(|e| value(e, 8)).collect();
+        assert_eq!(layers, ["1", "14"]);
+        let verts = entities(&p, "VERTEX");
+        let on = |layer: &str| -> Vec<(String, String)> {
+            verts
+                .iter()
+                .filter(|e| value(e, 8) == layer)
+                .map(|e| (value(e, 10).to_string(), value(e, 20).to_string()))
+                .collect()
+        };
+        let cut = on("1");
+        assert_eq!(cut.len(), 4);
+        assert!(cut.contains(&("-10".into(), "-10".into())));
+        assert!(cut.contains(&("110".into(), "110".into())));
+        assert_eq!(on("14").len(), 4);
+        assert!(on("14").contains(&("100".into(), "100".into())));
+        // Turn points mark the cut line's corners.
+        let points = entities(&p, "POINT");
+        assert_eq!(points.len(), 4);
+        assert!(points.iter().all(|e| value(e, 8) == "2" && value(e, 10).parse::<f64>().unwrap().abs() > 1.0));
+    }
+
+    #[test]
     fn open_pieces_skipped_and_names_unique() {
         let mut open = square("Open", 0.0);
         open.closed = false;
         let pattern = Pattern {
             pieces: vec![square("Sleeve", 0.0), square("sleeve", 200.0), square("Back/Yoke ✂", 400.0), open],
             seams: vec![],
+            ..Default::default()
         };
         let out = export_aama(&pattern, "S");
         assert_eq!(out.skipped, ["Open"]);

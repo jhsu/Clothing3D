@@ -6,7 +6,7 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 
 use crate::curves::HandleSide;
-use crate::model::{Pattern, Piece, Point, PointKind, Vec2};
+use crate::model::{Isometry, Pattern, Piece, Point, PointKind, Vec2};
 use crate::sewing::{EdgeSpan, OutlinePos, Seam};
 use crate::units::Units;
 
@@ -124,6 +124,10 @@ pub struct PointSpec {
     /// Outgoing Bézier handle as an offset from the point.
     #[serde(default)]
     pub handle_out: Option<Xy>,
+    /// Seam allowance of the segment starting at this point, overriding the
+    /// piece's (0 for none, e.g. on a fold).
+    #[serde(default)]
+    pub allowance: Option<Length>,
 }
 
 impl PointSpec {
@@ -133,8 +137,14 @@ impl PointSpec {
             kind: self.kind.map_or(PointKind::Turn, Into::into),
             handle_in: self.handle_in.as_ref().map(|h| h.mm(units)).transpose()?,
             handle_out: self.handle_out.as_ref().map(|h| h.mm(units)).transpose()?,
+            allowance: self.allowance.as_ref().map(|a| allowance_mm(a, units)).transpose()?,
         })
     }
+}
+
+fn allowance_mm(width: &Length, units: Units) -> Result<f64, String> {
+    let mm = width.mm(units)?;
+    if mm < 0.0 { Err("seam allowance can't be negative".into()) } else { Ok(mm) }
 }
 
 fn points(specs: &[PointSpec], units: Units) -> Result<Vec<Point>, String> {
@@ -219,6 +229,9 @@ pub struct AddPiece {
     /// Closed outline (default true).
     #[serde(default = "default_true")]
     pub closed: bool,
+    /// Seam allowance around the piece (default none).
+    #[serde(default)]
+    pub seam_allowance: Option<Length>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -260,6 +273,10 @@ pub struct UnfoldPiece {
     pub piece: PieceRef,
     /// Straight, contiguous, collinear segments forming the fold line.
     pub segments: Vec<usize>,
+    /// Keep the two halves linked, so later edits to one half are mirrored
+    /// onto the other (default false).
+    #[serde(default)]
+    pub symmetric: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -357,6 +374,22 @@ pub struct AddSeam {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct SetSeamAllowance {
+    pub piece: PieceRef,
+    /// Allowance width; 0 for none. Omit it with `segments` to give those
+    /// segments the piece's allowance again.
+    #[serde(default)]
+    pub width: Option<Length>,
+    /// Segments to set. Omit to set the whole piece's allowance, which also
+    /// resets every segment to it unless `keep_segment_widths`.
+    #[serde(default)]
+    pub segments: Option<Vec<usize>>,
+    /// With no `segments`: keep segments that have their own width.
+    #[serde(default)]
+    pub keep_segment_widths: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct SeamOnly {
     pub seam: usize,
 }
@@ -382,6 +415,7 @@ pub enum Edit {
     SetSegmentHandles(SetSegmentHandles),
     BendSegment(BendSegment),
     StraightenSegment(SegmentOnly),
+    SetSeamAllowance(SetSeamAllowance),
     AddSeam(AddSeam),
     RemoveSeam(SeamOnly),
     FlipSeam(SeamOnly),
@@ -519,6 +553,9 @@ impl Edit {
                 if e.closed && !piece.closed {
                     return Err("a closed piece needs at least 3 points".into());
                 }
+                if let Some(w) = &e.seam_allowance {
+                    piece.seam_allowance = allowance_mm(w, u)?;
+                }
                 pattern.pieces.push(piece);
                 let i = pattern.pieces.len() - 1;
                 Ok(Outcome { created: Some(("piece", i)), ..Outcome::piece(i) })
@@ -532,6 +569,10 @@ impl Edit {
                 }
                 let mut out = Outcome::piece(i);
                 drop_seams_on(pattern, i, &mut out);
+                if pattern.is_linked(i) {
+                    pattern.unlink(i);
+                    out.notes.push("the piece's symmetry links were removed".into());
+                }
                 let piece = &mut pattern.pieces[i];
                 piece.points = pts;
                 piece.closed = closed;
@@ -561,21 +602,27 @@ impl Edit {
                 if e.rotate.is_some_and(|r| !r.is_finite()) {
                     return Err("rotate must be a finite angle in degrees".into());
                 }
-                let piece = &mut pattern.pieces[i];
+                // Through the pattern, so symmetry links move with the piece.
                 if let Some(flip) = e.flip {
-                    piece.flip(matches!(flip, Flip::Horizontal));
+                    let iso = pattern.pieces[i].flipping(matches!(flip, Flip::Horizontal));
+                    pattern.transform_piece(i, &iso);
                 }
                 if let Some(deg) = e.rotate {
-                    piece.rotate(deg);
+                    let iso = pattern.pieces[i].rotation(deg);
+                    pattern.transform_piece(i, &iso);
                 }
                 if let Some(d) = delta {
-                    piece.translate(d);
+                    pattern.transform_piece(i, &Isometry::translation(d));
                 }
                 Ok(Outcome::piece(i))
             }
             Edit::UnfoldPiece(e) => {
                 let i = e.piece.resolve(pattern)?;
-                pattern.unfold(i, &e.segments)?;
+                if e.symmetric {
+                    pattern.unfold_symmetric(i, &e.segments)?;
+                } else {
+                    pattern.unfold(i, &e.segments)?;
+                }
                 Ok(Outcome::piece(i))
             }
             Edit::MovePoint(e) => {
@@ -690,6 +737,32 @@ impl Edit {
                 pattern.pieces[i].straighten_segment(e.segment);
                 Ok(Outcome::piece(i))
             }
+            Edit::SetSeamAllowance(e) => {
+                let i = e.piece.resolve(pattern)?;
+                let width = e.width.as_ref().map(|w| allowance_mm(w, u)).transpose()?;
+                let piece = &mut pattern.pieces[i];
+                let mut out = Outcome::piece(i);
+                if !piece.closed {
+                    out.notes.push("the piece is open, so its seam allowance won't show until it's closed".into());
+                }
+                match &e.segments {
+                    Some(segs) => {
+                        for &seg in segs {
+                            check_segment(piece, seg)?;
+                        }
+                        for &seg in segs {
+                            piece.points[seg].allowance = width;
+                        }
+                    }
+                    None => {
+                        piece.seam_allowance = width.ok_or("give `width` to set the whole piece's allowance")?;
+                        if !e.keep_segment_widths {
+                            piece.clear_allowance_overrides();
+                        }
+                    }
+                }
+                Ok(out)
+            }
             Edit::AddSeam(e) => {
                 let (a, b) = (span(pattern, &e.a)?, span(pattern, &e.b)?);
                 pattern.seams.push(Seam { a, b });
@@ -717,9 +790,16 @@ impl Edit {
 pub fn apply_all(edits: &[Edit], pattern: &mut Pattern, env: &EditEnv) -> Result<Outcome, String> {
     let mut out = Outcome::default();
     for (n, edit) in edits.iter().enumerate() {
-        let step = edit.apply(pattern, env).map_err(|e| {
+        let before = pattern.clone();
+        let mut step = edit.apply(pattern, env).map_err(|e| {
             if edits.len() > 1 { format!("edit {n} failed, nothing was changed: {e}") } else { e }
         })?;
+        // Repeat the edit on linked symmetric pieces and halves.
+        if pattern.mirror_changes(&before, None) || pattern.symmetries != before.symmetries {
+            let linked = pattern.symmetries.iter().filter(|s| step.touched.iter().any(|&i| s.touches(i)));
+            let linked: Vec<usize> = linked.flat_map(|s| [s.a, s.b]).collect();
+            step.merge(Outcome { touched: linked, ..Outcome::default() });
+        }
         // Removing pieces invalidates earlier touched indices.
         out.touched.retain(|&i| i < pattern.pieces.len());
         out.merge(step);
@@ -815,5 +895,27 @@ mod tests {
         ]));
         let err = apply_all(&edits, &mut p, &env(Units::Millimeters)).unwrap_err();
         assert!(err.starts_with("edit 1 failed"), "{err}");
+    }
+
+    #[test]
+    fn edits_to_symmetric_halves_are_mirrored() {
+        let mut p = square_pattern();
+        let edits: Vec<Edit> = json(serde_json::json!([
+            {"op": "unfold_piece", "piece": 0, "segments": [1], "symmetric": true},
+            // Unfolded, point i mirrors point (n - i) % n; point 2 is (0, 0) and point 1 (0, 100).
+            {"op": "move_point", "piece": 0, "point": 2, "by": {"x": 0, "y": 20}},
+            {"op": "transform_piece", "piece": 0, "translate": {"x": 50, "y": 0}},
+            {"op": "move_point", "piece": 0, "point": 1, "by": {"x": 0, "y": -10}},
+        ]));
+        let out = apply_all(&edits, &mut p, &env(Units::Millimeters)).unwrap();
+        assert_eq!(out.touched, [0]);
+        let pts: Vec<Vec2> = p.pieces[0].points.iter().map(|q| q.pos).collect();
+        let n = pts.len();
+        for (i, q) in pts.iter().enumerate() {
+            let m = pts[(n - i) % n];
+            // Mirror line moved with the piece to x = 150.
+            assert!((q.x + m.x - 300.0).abs() < 1e-9 && (q.y - m.y).abs() < 1e-9, "{i}: {q:?} vs {m:?}");
+        }
+        assert_eq!(pts.iter().filter(|q| q.y == 20.0 || q.y == 90.0).count(), 4);
     }
 }

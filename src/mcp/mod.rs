@@ -284,7 +284,9 @@ impl Tools {
     }
 
     /// Mirror a closed piece across a fold line made of straight, contiguous,
-    /// collinear segments, merging both halves into one symmetric piece.
+    /// collinear segments, merging both halves into one symmetric piece. With
+    /// `symmetric`, the halves stay linked: later edits to one half are
+    /// mirrored onto the other.
     #[tool]
     async fn unfold_piece(&self, Parameters(p): Parameters<edit::UnfoldPiece>) -> Result<CallToolResult, ErrorData> {
         self.edit("unfold piece", vec![Edit::UnfoldPiece(p)]).await
@@ -363,6 +365,18 @@ impl Tools {
         self.edit("straighten segment", vec![Edit::StraightenSegment(p)]).await
     }
 
+    /// Set seam allowance (the cut line outside the sew-line outline). Without
+    /// `segments`, sets the whole piece's allowance and resets every segment
+    /// to it. With `segments`, gives just those their own width (e.g. a deeper
+    /// hem, 0 on a fold), or with no `width` returns them to the piece's.
+    #[tool]
+    async fn set_seam_allowance(
+        &self,
+        Parameters(p): Parameters<edit::SetSeamAllowance>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.edit("set seam allowance", vec![Edit::SetSeamAllowance(p)]).await
+    }
+
     /// Sew two edges together. Each edge is a whole segment, or a stretch of
     /// outline from `start` to `end` (each a point, or a segment + t). The
     /// starts of the two edges are sewn to each other. Returns the seam and
@@ -413,7 +427,9 @@ impl Tools {
 immediately and can undo it. Lengths and coordinates use the user's display units (named in every \
 reply as \"units\"); bare numbers are in those units, and strings may name a unit: \"90mm\", \"9 cm\", \
 \"3 1/2 in\". Y points up. Pieces are outlines of turn (corner) and curve (smooth) points; segment i \
-runs from point i to point i+1. Call get_pattern first, render to look at shapes, and batch for \
+runs from point i to point i+1. Outlines are sew lines; seam allowance (set_seam_allowance) adds a \
+cut line outside them, per piece or per segment. Symmetric pieces (get_pattern lists them under \
+\"symmetries\") are linked: an edit to one side is repeated, mirrored, on the other. Call get_pattern first, render to look at shapes, and batch for \
 multi-step changes. Indices shift after inserting or removing points, pieces and seams; every edit \
 reply lists the updated pieces."
 )]

@@ -162,7 +162,7 @@ pub fn render_png(pattern: &Pattern, opts: &RenderOptions) -> Result<Vec<u8>, St
     };
     let (lo, hi) = shown
         .iter()
-        .filter_map(|&i| pattern.pieces[i].bounds())
+        .filter_map(|&i| pattern.pieces[i].outer_bounds())
         .reduce(|(a, b), (c, d)| (Vec2::new(a.x.min(c.x), a.y.min(c.y)), Vec2::new(b.x.max(d.x), b.y.max(d.y))))
         .ok_or("nothing to render: the pattern (or piece) has no points")?;
     let span = Vec2::new((hi.x - lo.x).max(1.0), (hi.y - lo.y).max(1.0));
@@ -181,6 +181,11 @@ pub fn render_png(pattern: &Pattern, opts: &RenderOptions) -> Result<Vec<u8>, St
 
     for &i in &shown {
         let piece = &pattern.pieces[i];
+        let cut = piece.cut_line();
+        if let Some(path) = c.path(&cut, true) {
+            c.fill(&path, Color::from_rgba8(246, 242, 232, 255));
+            c.stroke(&path, ink, 1.0, false);
+        }
         let outline = piece.flatten();
         if let Some(path) = c.path(&outline, piece.closed) {
             if piece.closed {

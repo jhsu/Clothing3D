@@ -7,7 +7,7 @@
 //! JSON file format.
 
 use clothes3d_core::curves::HandleSide;
-use clothes3d_core::model::{Pattern, Piece, Point, PointKind, Vec2};
+use clothes3d_core::model::{Isometry, Pattern, Piece, Point, PointKind, Vec2};
 use clothes3d_core::sewing::{EdgeSpan, OutlinePos, Seam};
 use wasm_bindgen::prelude::*;
 
@@ -168,20 +168,23 @@ impl PatternDoc {
 
     #[wasm_bindgen(js_name = translatePiece)]
     pub fn translate_piece(&mut self, piece: usize, dx: f64, dy: f64) -> Result<(), JsError> {
-        self.piece_mut(piece)?.translate(Vec2::new(dx, dy));
+        self.piece(piece)?;
+        self.pattern.transform_piece(piece, &Isometry::translation(Vec2::new(dx, dy)));
         Ok(())
     }
 
     /// Rotate counter-clockwise about the piece's center.
     #[wasm_bindgen(js_name = rotatePiece)]
     pub fn rotate_piece(&mut self, piece: usize, degrees: f64) -> Result<(), JsError> {
-        self.piece_mut(piece)?.rotate(degrees);
+        let iso = self.piece(piece)?.rotation(degrees);
+        self.pattern.transform_piece(piece, &iso);
         Ok(())
     }
 
     #[wasm_bindgen(js_name = flipPiece)]
     pub fn flip_piece(&mut self, piece: usize, horizontal: bool) -> Result<(), JsError> {
-        self.piece_mut(piece)?.flip(horizontal);
+        let iso = self.piece(piece)?.flipping(horizontal);
+        self.pattern.transform_piece(piece, &iso);
         Ok(())
     }
 
@@ -353,6 +356,54 @@ impl PatternDoc {
     pub fn set_segment_length(&mut self, piece: usize, seg: usize, length: f64, move_start: bool) -> Result<bool, JsError> {
         self.segment(piece, seg)?;
         Ok(self.pattern.pieces[piece].set_segment_length(seg, length, move_start))
+    }
+
+    // ---- seam allowance ---------------------------------------------------
+
+    /// The piece's default seam allowance (mm).
+    #[wasm_bindgen(js_name = seamAllowance)]
+    pub fn seam_allowance(&self, piece: usize) -> Result<f64, JsError> {
+        Ok(self.piece(piece)?.seam_allowance)
+    }
+
+    /// Set the whole piece's seam allowance (mm; 0 removes it). Segments with
+    /// their own width are reset to it unless `keep_segment_widths`.
+    #[wasm_bindgen(js_name = setSeamAllowance)]
+    pub fn set_seam_allowance(&mut self, piece: usize, width: f64, keep_segment_widths: bool) -> Result<(), JsError> {
+        let p = self.piece_mut(piece)?;
+        p.seam_allowance = width.max(0.0);
+        if !keep_segment_widths {
+            p.clear_allowance_overrides();
+        }
+        Ok(())
+    }
+
+    /// Effective seam allowance (mm) of a segment.
+    #[wasm_bindgen(js_name = segmentAllowance)]
+    pub fn segment_allowance(&self, piece: usize, seg: usize) -> Result<f64, JsError> {
+        Ok(self.segment(piece, seg)?.segment_allowance(seg))
+    }
+
+    /// Whether a segment has its own seam allowance instead of the piece's.
+    #[wasm_bindgen(js_name = segmentHasOwnAllowance)]
+    pub fn segment_has_own_allowance(&self, piece: usize, seg: usize) -> Result<bool, JsError> {
+        Ok(self.segment(piece, seg)?.points[seg].allowance.is_some())
+    }
+
+    /// Give a segment its own seam allowance (mm), or with `undefined`, the
+    /// piece's again.
+    #[wasm_bindgen(js_name = setSegmentAllowance)]
+    pub fn set_segment_allowance(&mut self, piece: usize, seg: usize, width: Option<f64>) -> Result<(), JsError> {
+        self.segment(piece, seg)?;
+        self.pattern.pieces[piece].points[seg].allowance = width.map(|w| w.max(0.0));
+        Ok(())
+    }
+
+    /// Cut line as flat `[x0, y0, x1, y1, ...]` (closed, first point
+    /// repeated); empty without seam allowance.
+    #[wasm_bindgen(js_name = cutLine)]
+    pub fn cut_line(&self, piece: usize) -> Result<Vec<f64>, JsError> {
+        Ok(flat(&self.piece(piece)?.cut_line()))
     }
 
     // ---- seams ------------------------------------------------------------

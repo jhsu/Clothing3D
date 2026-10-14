@@ -203,8 +203,9 @@ impl Pattern {
         }
     }
 
-    /// Insert a point on an outline segment. Returns the new point's index.
-    pub fn insert_point(&mut self, piece: usize, seg: usize, t0: f64) -> usize {
+    /// Insert a point on an outline segment, ignoring symmetry links.
+    /// Returns the new point's index.
+    pub(crate) fn insert_point_raw(&mut self, piece: usize, seg: usize, t0: f64) -> usize {
         let idx = self.pieces[piece].insert_on_segment(seg, t0);
         self.remap_positions(piece, |p| {
             if p.seg > seg {
@@ -222,9 +223,10 @@ impl Pattern {
         idx
     }
 
-    /// Remove point `i`, opening the outline below 3 points and removing the
-    /// piece once empty. Returns `true` if the whole piece was removed.
-    pub fn remove_point(&mut self, piece: usize, i: usize) -> bool {
+    /// Remove point `i`, ignoring symmetry links, opening the outline below 3
+    /// points and removing the piece once empty. Returns `true` if the whole
+    /// piece was removed.
+    pub(crate) fn remove_point_raw(&mut self, piece: usize, i: usize) -> bool {
         let p = &mut self.pieces[piece];
         let n = p.points.len();
         let was_closed = p.closed;
@@ -274,19 +276,28 @@ impl Pattern {
     pub fn duplicate_piece(&mut self, piece: usize) -> usize {
         let mut copy = self.pieces[piece].clone();
         copy.name = format!("{} copy", copy.name);
-        if let Some((lo, hi)) = copy.bounds() {
-            copy.translate(Vec2::new(hi.x - lo.x + 20.0, 0.0));
-        }
+        copy.translate(self.duplicate_offset(piece));
         self.pieces.push(copy);
         self.pieces.len() - 1
+    }
+
+    /// How far [`Self::duplicate_piece`] moves the copy: just clear to the right.
+    pub(crate) fn duplicate_offset(&self, piece: usize) -> Vec2 {
+        self.pieces[piece].bounds().map_or_else(Vec2::default, |(lo, hi)| Vec2::new(hi.x - lo.x + 20.0, 0.0))
     }
 
     /// Unfold a closed piece across a fold line made of the straight,
     /// contiguous, collinear segments `segs`: the piece is mirrored over that
     /// line and both halves merge into one symmetric outline. Points inside
     /// the fold line are dropped. Seams on the original half are kept; seams
-    /// on the fold are dropped.
+    /// on the fold are dropped, and so are symmetry links on the piece.
     pub fn unfold(&mut self, piece: usize, segs: &[usize]) -> Result<(), &'static str> {
+        self.unfold_along(piece, segs).map(|_| ())
+    }
+
+    /// [`Self::unfold`], returning the fold line's end points. In the
+    /// unfolded outline point `i` mirrors point `(n - i) % n`.
+    pub(crate) fn unfold_along(&mut self, piece: usize, segs: &[usize]) -> Result<(Vec2, Vec2), &'static str> {
         let p = &self.pieces[piece];
         let n = p.points.len();
         if !p.closed || n < 3 {
@@ -330,15 +341,19 @@ impl Pattern {
         let dir = fb - fa;
         let reflect_offset = |v: Vec2| reflect(v, Vec2::default(), dir);
         // The mirrored half runs in reverse, so incoming and outgoing swap.
-        let mirrored = half[1..half.len() - 1].iter().rev().map(|pt| Point {
-            pos: reflect(pt.pos, fa, fb),
-            kind: pt.kind,
-            handle_in: pt.handle_out.map(reflect_offset),
-            handle_out: pt.handle_in.map(reflect_offset),
+        // A mirrored segment runs backwards, so it starts at the mirror of the
+        // original segment's end point and takes that segment's allowance.
+        let mirrored = (1..half.len() - 1).rev().map(|i| Point {
+            pos: reflect(half[i].pos, fa, fb),
+            kind: half[i].kind,
+            handle_in: half[i].handle_out.map(reflect_offset),
+            handle_out: half[i].handle_in.map(reflect_offset),
+            allowance: half[i - 1].allowance,
         });
         let mirrored: Vec<Point> = mirrored.collect();
         // The fold ends now join their own mirror images.
         let last = half.len() - 1;
+        half[last].allowance = half[last - 1].allowance;
         half[0].handle_in = half[0].handle_out.map(reflect_offset);
         half[last].handle_out = half[last].handle_in.map(reflect_offset);
         let points: Vec<Point> = half.into_iter().chain(mirrored).collect();
@@ -351,7 +366,8 @@ impl Pattern {
         // Original segment j now starts at index (j - b) mod n.
         self.remap_positions(piece, |pos| OutlinePos::new((pos.seg + n - b) % n, pos.t));
         self.pieces[piece].points = points;
-        Ok(())
+        self.validate_symmetries();
+        Ok((fa, fb))
     }
 
     pub fn remove_piece(&mut self, piece: usize) {
@@ -363,6 +379,11 @@ impl Pattern {
                     span.piece -= 1;
                 }
             }
+        }
+        self.symmetries.retain(|s| s.a != piece && s.b != piece);
+        for s in &mut self.symmetries {
+            s.a -= usize::from(s.a > piece);
+            s.b -= usize::from(s.b > piece);
         }
     }
 
@@ -426,7 +447,7 @@ mod tests {
         let pieces = vec![square(0.0), square(200.0)];
         let a = EdgeSpan::shortest(&pieces, 0, OutlinePos::new(1, 0.0), OutlinePos::new(1, 1.0));
         let b = EdgeSpan::shortest(&pieces, 1, OutlinePos::new(3, 1.0), OutlinePos::new(3, 0.0));
-        Pattern { pieces, seams: vec![Seam { a, b }] }
+        Pattern { pieces, seams: vec![Seam { a, b }], ..Pattern::default() }
     }
 
     #[test]

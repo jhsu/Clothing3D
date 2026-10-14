@@ -12,7 +12,7 @@ use crate::dxf;
 use crate::palette::{Entry, Palette};
 use crate::settings::Settings;
 use crate::units::Units;
-use crate::model::{Pattern, Piece, Point, PointKind, Vec2};
+use crate::model::{Isometry, Pattern, Piece, Point, PointKind, Vec2, triangulate};
 use crate::sewing::{EdgeSpan, OutlinePos, Seam, point_at_fraction};
 use crate::view::View;
 
@@ -52,7 +52,9 @@ impl Tool {
                 "Click a point or edge to select (Shift+click for several), or drag a box on empty \
                  canvas (Ctrl+drag over pieces) to select points. Type a length + Enter \
                  to resize one segment. Drag to move (arrows nudge), drag handles to shape curves. \
-                 Double-click an edge to add a point. R rotate, H flip, Ctrl+D duplicate, U unfold"
+                 Double-click an edge to add a point. R rotate, H flip, Ctrl+D duplicate, U unfold. \
+                 Shift+U unfolds symmetric and Ctrl+Shift+D makes a mirrored copy: edits to one side \
+                 are mirrored onto the other"
             }
             Tool::Draw => {
                 "Click to place points, or type a length + Enter to place the next point toward the \
@@ -85,6 +87,7 @@ enum Command {
     ToggleSnapPoints,
     ToggleMatchSnap,
     ToggleLengths,
+    ToggleAllowance,
     ToggleUnits,
     Settings,
     Delete,
@@ -96,7 +99,12 @@ enum Command {
     FlipH,
     FlipV,
     Duplicate,
+    DuplicateMirrored,
     Unfold,
+    UnfoldSymmetric,
+    Unlink,
+    AddAllowance,
+    RemoveAllowance,
 }
 
 /// Palette rows: command, label, shortcut. Tools first, since activating a
@@ -120,6 +128,7 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::ToggleSnapPoints, "Toggle snap to points", ""),
     (Command::ToggleMatchSnap, "Toggle snap to matching seam length", ""),
     (Command::ToggleLengths, "Toggle segment length labels", "L"),
+    (Command::ToggleAllowance, "Toggle seam allowance display", ""),
     (Command::ToggleUnits, "Toggle units (mm / inches)", ""),
     (Command::Settings, "Settings…", ""),
     (Command::Delete, "Delete selection", "Del"),
@@ -131,16 +140,21 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::FlipH, "Flip piece horizontally", "H"),
     (Command::FlipV, "Flip piece vertically", "Shift+H"),
     (Command::Duplicate, "Duplicate piece", "Ctrl+D"),
+    (Command::DuplicateMirrored, "Duplicate piece mirrored (linked symmetric)", "Ctrl+Shift+D"),
     (Command::Unfold, "Unfold piece along selected edges", "U"),
+    (Command::UnfoldSymmetric, "Unfold piece symmetric (linked halves)", "Shift+U"),
+    (Command::Unlink, "Unlink symmetric piece", ""),
+    (Command::AddAllowance, "Add seam allowance around piece", ""),
+    (Command::RemoveAllowance, "Remove seam allowance from piece", ""),
 ];
 
 /// An in-progress drag with the Select tool.
 enum Drag {
     /// Selected points, moved together by the grabbed point's (snapped) offset.
     Points { grabbed: PointRef, original: Vec<(PointRef, Vec2)> },
-    /// Whole piece; positions are offset from the originals so grid snapping
+    /// Whole piece, `moved` so far from where the drag started; grid snapping
     /// applies to the total displacement rather than accumulating error.
-    Piece { piece: usize, start: Vec2, original: Vec<Vec2> },
+    Piece { piece: usize, start: Vec2, moved: Vec2 },
     /// One Bézier handle of a point.
     Handle { point: PointRef, side: HandleSide },
     /// Bending a segment: the curve point at `t` follows the cursor, starting
@@ -461,19 +475,12 @@ impl App {
             self.pattern.seams.remove(i);
         } else if !self.selected_points.is_empty() {
             self.checkpoint();
-            // Highest piece, then highest point first, so earlier removals
-            // don't shift the indices of later ones.
-            let mut points = std::mem::take(&mut self.selected_points);
-            points.sort_by_key(|r| std::cmp::Reverse((r.piece, r.point)));
-            points.dedup();
-            for r in points {
-                if r.piece < self.pattern.pieces.len()
-                    && r.point < self.pattern.pieces[r.piece].points.len()
-                    && self.pattern.remove_point(r.piece, r.point)
-                    && self.drawing == Some(r.piece)
-                {
-                    self.drawing = None;
-                }
+            // Mirror images on linked symmetric pieces go too.
+            let points: Vec<(usize, usize)> = self.selected_points.drain(..).map(|r| (r.piece, r.point)).collect();
+            let removed = self.pattern.remove_points(&points);
+            // Removing a piece shifts the indices after it.
+            if self.drawing.is_some_and(|d| removed.iter().any(|&p| p <= d)) {
+                self.drawing = None;
             }
             self.selected_segments.clear();
         } else if let Some(i) = self.selected_piece.take() {
@@ -534,6 +541,15 @@ impl App {
                 }
             }
         }
+        // Mirror images on linked symmetric pieces show their handles too.
+        for r in out.clone() {
+            for (piece, point) in self.pattern.mirror_images(r.piece, r.point) {
+                let m = PointRef { piece, point };
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        }
         out
     }
 
@@ -548,6 +564,26 @@ impl App {
                 (self.view.to_screen(rect, pos + h).distance(screen) <= PICK_PX).then_some((r, side))
             })
         })
+    }
+
+    /// The point an edit in progress centers on. Where both sides of a
+    /// symmetry link changed, its side wins.
+    fn mirror_focus(&self) -> Option<(usize, usize)> {
+        let r = match &self.dragging {
+            Some(Drag::Points { grabbed, .. }) => Some(*grabbed),
+            Some(Drag::Handle { point, .. }) => Some(*point),
+            _ => self.selected_points.first().copied(),
+        }?;
+        Some((r.piece, r.point))
+    }
+
+    /// Repeat the edits made since `before` on linked symmetric pieces and
+    /// halves. Edits are made to one side only and mirrored here, once per
+    /// frame before painting, so the other side follows live while dragging.
+    /// Returns whether anything changed.
+    fn mirror_edits(&mut self, before: &Pattern) -> bool {
+        let focus = self.mirror_focus();
+        self.pattern.mirror_changes(before, focus)
     }
 
     // ------------------------------------------------------------- selection
@@ -669,24 +705,40 @@ impl App {
 
     // ------------------------------------------------------ piece transforms
 
+    // Whole-piece moves go through the pattern so symmetry links move along.
+
     fn rotate_selected(&mut self, degrees: f64) {
         let Some(pi) = self.selected_piece else { return };
         self.checkpoint();
-        self.pattern.pieces[pi].rotate(degrees);
+        let iso = self.pattern.pieces[pi].rotation(degrees);
+        self.pattern.transform_piece(pi, &iso);
     }
 
     fn flip_selected(&mut self, horizontal: bool) {
         let Some(pi) = self.selected_piece else { return };
         self.checkpoint();
-        self.pattern.pieces[pi].flip(horizontal);
+        let iso = self.pattern.pieces[pi].flipping(horizontal);
+        self.pattern.transform_piece(pi, &iso);
     }
 
-    fn duplicate_selected(&mut self) {
+    /// Copy the selected piece; `mirrored` flips the copy and links the two
+    /// so edits to either are mirrored onto the other.
+    fn duplicate_selected(&mut self, mirrored: bool) {
         let Some(pi) = self.selected_piece else { return };
         self.checkpoint();
-        let copy = self.pattern.duplicate_piece(pi);
+        let copy = if mirrored { self.pattern.duplicate_mirrored(pi) } else { self.pattern.duplicate_piece(pi) };
         self.clear_selection();
         self.selected_piece = Some(copy);
+        if mirrored {
+            self.status = "Mirrored copy linked: edits to either piece are mirrored onto the other".into();
+        }
+    }
+
+    fn unlink_selected(&mut self) {
+        let Some(pi) = self.selected_piece.filter(|&pi| self.pattern.is_linked(pi)) else { return };
+        self.checkpoint();
+        self.pattern.unlink(pi);
+        self.status = "Symmetry unlinked: the sides are now edited independently".into();
     }
 
     /// Piece and segments of the current segment selection, if all on one piece.
@@ -698,7 +750,8 @@ impl App {
             .then(|| (pi, self.selected_segments.iter().map(|&(_, s)| s).collect()))
     }
 
-    fn unfold_selected(&mut self) {
+    /// Unfold along the selected edges; `symmetric` keeps the halves linked.
+    fn unfold_selected(&mut self, symmetric: bool) {
         let Some((pi, segs)) = self.fold_selection() else {
             self.status = "Select the straight edge(s) of one closed piece to unfold along \
                            (Shift+click for several)"
@@ -706,11 +759,17 @@ impl App {
             return;
         };
         self.checkpoint();
-        match self.pattern.unfold(pi, &segs) {
+        let result =
+            if symmetric { self.pattern.unfold_symmetric(pi, &segs) } else { self.pattern.unfold(pi, &segs) };
+        match result {
             Ok(()) => {
                 self.clear_selection();
                 self.selected_piece = Some(pi);
-                self.status = "Piece unfolded".into();
+                self.status = if symmetric {
+                    "Piece unfolded symmetric: edits to one half are mirrored onto the other".into()
+                } else {
+                    "Piece unfolded".into()
+                };
             }
             Err(e) => {
                 self.undo.pop();
@@ -729,7 +788,7 @@ impl App {
     }
 
     fn fit_view(&mut self, rect: Rect) {
-        let Some((min, max)) = self.pattern.pieces.iter().filter_map(|p| p.bounds()).reduce(
+        let Some((min, max)) = self.pattern.pieces.iter().filter_map(|p| p.outer_bounds()).reduce(
             |(lo, hi), (a, b)| {
                 (Vec2::new(lo.x.min(a.x), lo.y.min(a.y)), Vec2::new(hi.x.max(b.x), hi.y.max(b.y)))
             },
@@ -800,7 +859,6 @@ impl App {
         }
     }
 
-    /// Move the selected piece by `d` (one undo step per call).
     /// Move the selected points by `d`, or the whole selected piece if no
     /// points are selected (one undo step per call).
     fn nudge_selected(&mut self, d: Vec2) {
@@ -814,7 +872,7 @@ impl App {
         }
         let Some(pi) = self.selected_piece else { return };
         self.checkpoint();
-        self.pattern.pieces[pi].translate(d);
+        self.pattern.transform_piece(pi, &Isometry::translation(d));
     }
 
     /// Snap a world position to existing points (excluding `skip`) or the grid.
@@ -836,7 +894,9 @@ impl App {
 
     // -------------------------------------------------------------- viewport
 
-    fn viewport(&mut self, ui: &mut egui::Ui) {
+    /// The canvas. `frame_start` is the pattern at the start of the frame,
+    /// for mirroring this frame's edits before painting.
+    fn viewport(&mut self, ui: &mut egui::Ui, frame_start: &Pattern) {
         let (response, painter) =
             ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
@@ -877,6 +937,7 @@ impl App {
         }
         response.context_menu(|ui| self.viewport_context_menu(ui));
 
+        self.mirror_edits(frame_start);
         self.paint(&painter, rect, hover);
     }
 
@@ -954,9 +1015,8 @@ impl App {
                 && let Some(pi) = self.pick_piece(rect, pos)
             {
                 self.checkpoint();
-                let original = self.pattern.pieces[pi].points.iter().map(|p| p.pos).collect();
                 let start = self.view.to_world(rect, pos);
-                self.dragging = Some(Drag::Piece { piece: pi, start, original });
+                self.dragging = Some(Drag::Piece { piece: pi, start, moved: Vec2::default() });
                 if self.selected_piece != Some(pi) {
                     self.clear_selection();
                     self.selected_piece = Some(pi);
@@ -983,11 +1043,10 @@ impl App {
                         }
                     }
                 }
-                Some(Drag::Piece { piece, start, original }) => {
-                    let d = self.snap_offset(self.view.to_world(rect, pos) - *start);
-                    for (p, o) in self.pattern.pieces[*piece].points.iter_mut().zip(original) {
-                        p.pos = *o + d;
-                    }
+                &Some(Drag::Piece { piece, start, moved }) => {
+                    let d = self.snap_offset(self.view.to_world(rect, pos) - start);
+                    self.pattern.transform_piece(piece, &Isometry::translation(d - moved));
+                    self.dragging = Some(Drag::Piece { piece, start, moved: d });
                 }
                 &Some(Drag::Handle { point, side }) => {
                     let piece = &mut self.pattern.pieces[point.piece];
@@ -1190,6 +1249,23 @@ impl App {
             } else {
                 Color32::from_rgb(40, 40, 40)
             };
+            if self.settings.show_allowance {
+                let mut cut = piece.cut_line();
+                cut.pop(); // closing vertex
+                if cut.len() >= 3 {
+                    let fill = fill_color(pi, selected).gamma_multiply(0.35);
+                    let mut mesh = egui::Mesh::default();
+                    for &p in &cut {
+                        mesh.colored_vertex(to_screen(p), fill);
+                    }
+                    for [a, b, c] in triangulate(&cut) {
+                        mesh.add_triangle(a as u32, b as u32, c as u32);
+                    }
+                    painter.add(mesh);
+                    let line: Vec<Pos2> = cut.into_iter().map(to_screen).collect();
+                    painter.add(egui::Shape::closed_line(line, Stroke::new(1.0, color)));
+                }
+            }
             let (poly, tris) = piece.fill_triangles();
             if !tris.is_empty() {
                 let fill = fill_color(pi, selected);
@@ -1264,6 +1340,7 @@ impl App {
             paint_label(&painter, mid + egui::vec2(12.0, -14.0), &text, Color32::from_rgb(180, 80, 0));
         }
 
+        self.paint_symmetry(&painter, rect);
         self.paint_handles(&painter, rect);
 
         for (i, seam) in self.pattern.seams.iter().enumerate() {
@@ -1365,6 +1442,35 @@ impl App {
                 };
                 let text = units.format(piece.segment_length(seg));
                 paint_label_at(painter, pos, anchor, 11.0, &text, color);
+            }
+        }
+    }
+
+    /// The dashed mirror line of every symmetry link, spanning its pieces,
+    /// and a ring on the mirror image of each selected point.
+    fn paint_symmetry(&self, painter: &egui::Painter, rect: Rect) {
+        let pieces = &self.pattern.pieces;
+        for s in &self.pattern.symmetries {
+            let Some((o, d)) = s.axis() else { continue };
+            let along = [s.a, s.b].into_iter().flat_map(|pi| pieces[pi].flatten()).map(|p| (p - o).dot(d));
+            let (lo, hi) = along.fold((f64::MAX, f64::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+            if lo > hi {
+                continue;
+            }
+            let margin = 24.0 / self.view.zoom;
+            let ends = [o + d * (lo - margin), o + d * (hi + margin)].map(|p| self.view.to_screen(rect, p));
+            let selected = self.selected_piece.is_some_and(|pi| s.touches(pi));
+            let color = Color32::from_rgb(120, 60, 200);
+            let stroke = if selected { Stroke::new(1.5, color) } else { Stroke::new(1.0, color.gamma_multiply(0.6)) };
+            painter.extend(egui::Shape::dashed_line(&ends, stroke, 10.0, 6.0));
+        }
+        let orange = Color32::from_rgb(240, 120, 0);
+        for r in &self.selected_points {
+            for (piece, point) in self.pattern.mirror_images(r.piece, r.point) {
+                if !self.selected_points.contains(&PointRef { piece, point }) {
+                    let s = self.view.to_screen(rect, pieces[piece].points[point].pos);
+                    painter.circle_stroke(s, 6.5, Stroke::new(1.5, orange));
+                }
             }
         }
     }
@@ -1685,12 +1791,14 @@ impl App {
             self.settings.snap_grid = !self.settings.snap_grid;
         }
 
-        let (rotate, flip, unfold, duplicate, lengths) = ctx.input_mut(|i| {
+        let (rotate, flip, unfold, mirrored, duplicate, lengths) = ctx.input_mut(|i| {
             let plain = !i.modifiers.command && !i.modifiers.alt;
             (
                 (plain && i.key_pressed(Key::R)).then_some(if i.modifiers.shift { 90.0 } else { -90.0 }),
                 (plain && i.key_pressed(Key::H)).then_some(!i.modifiers.shift),
-                plain && i.key_pressed(Key::U),
+                (plain && i.key_pressed(Key::U)).then_some(i.modifiers.shift),
+                // Ctrl+Shift+D must be consumed before Ctrl+D.
+                i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D),
                 i.consume_key(Modifiers::COMMAND, Key::D),
                 plain && i.key_pressed(Key::L),
             )
@@ -1704,11 +1812,11 @@ impl App {
         if let Some(horizontal) = flip {
             self.flip_selected(horizontal);
         }
-        if unfold {
-            self.unfold_selected();
+        if let Some(symmetric) = unfold {
+            self.unfold_selected(symmetric);
         }
-        if duplicate {
-            self.duplicate_selected();
+        if mirrored || duplicate {
+            self.duplicate_selected(mirrored);
         }
     }
 
@@ -1771,8 +1879,12 @@ impl App {
             | Command::RotateCcw
             | Command::FlipH
             | Command::FlipV
-            | Command::Duplicate => piece,
-            Command::Unfold => self.can_unfold(),
+            | Command::Duplicate
+            | Command::DuplicateMirrored => piece,
+            Command::Unfold | Command::UnfoldSymmetric => self.can_unfold(),
+            Command::Unlink => self.selected_piece.is_some_and(|pi| self.pattern.is_linked(pi)),
+            Command::AddAllowance => self.selected_piece.is_some_and(|pi| self.pattern.pieces[pi].closed),
+            Command::RemoveAllowance => self.selected_piece.is_some_and(|pi| self.pattern.pieces[pi].has_allowance()),
             _ => true,
         }
     }
@@ -1796,6 +1908,7 @@ impl App {
             Command::ToggleSnapPoints => self.settings.snap_points = !self.settings.snap_points,
             Command::ToggleMatchSnap => self.settings.snap_match = !self.settings.snap_match,
             Command::ToggleLengths => self.settings.show_lengths = !self.settings.show_lengths,
+            Command::ToggleAllowance => self.settings.show_allowance = !self.settings.show_allowance,
             Command::ToggleUnits => self.settings.toggle_units(),
             Command::Settings => self.show_settings = true,
             Command::Delete => self.delete_selection(),
@@ -1806,8 +1919,21 @@ impl App {
             Command::RotateCcw => self.rotate_selected(90.0),
             Command::FlipH => self.flip_selected(true),
             Command::FlipV => self.flip_selected(false),
-            Command::Duplicate => self.duplicate_selected(),
-            Command::Unfold => self.unfold_selected(),
+            Command::Duplicate => self.duplicate_selected(false),
+            Command::DuplicateMirrored => self.duplicate_selected(true),
+            Command::Unfold => self.unfold_selected(false),
+            Command::UnfoldSymmetric => self.unfold_selected(true),
+            Command::Unlink => self.unlink_selected(),
+            Command::AddAllowance => {
+                if let Some(pi) = self.selected_piece {
+                    self.set_piece_allowance(pi, self.settings.seam_allowance);
+                }
+            }
+            Command::RemoveAllowance => {
+                if let Some(pi) = self.selected_piece {
+                    self.set_piece_allowance(pi, 0.0);
+                }
+            }
         }
     }
 
@@ -1898,10 +2024,21 @@ impl App {
                 }
                 ui.separator();
                 if item(ui, has, "Duplicate  (Ctrl+D)") {
-                    self.duplicate_selected();
+                    self.duplicate_selected(false);
                 }
                 if item(ui, self.can_unfold(), "Unfold along selected edge  (U)") {
-                    self.unfold_selected();
+                    self.unfold_selected(false);
+                }
+                ui.separator();
+                if item(ui, has, "Duplicate mirrored, linked  (Ctrl+Shift+D)") {
+                    self.duplicate_selected(true);
+                }
+                if item(ui, self.can_unfold(), "Unfold symmetric, linked  (Shift+U)") {
+                    self.unfold_selected(true);
+                }
+                let linked = self.selected_piece.is_some_and(|pi| self.pattern.is_linked(pi));
+                if item(ui, linked, "Unlink symmetry") {
+                    self.unlink_selected();
                 }
             });
             ui.menu_button("View", |ui| {
@@ -1910,6 +2047,7 @@ impl App {
                     ui.close();
                 }
                 ui.checkbox(&mut self.settings.show_lengths, "Segment lengths  (L)");
+                ui.checkbox(&mut self.settings.show_allowance, "Seam allowance");
                 ui.menu_button("Units", |ui| {
                     for units in [Units::Millimeters, Units::Inches] {
                         if ui.radio(self.settings.units == units, units.name()).clicked()
@@ -1963,9 +2101,10 @@ impl App {
         let mut clicked = None;
         for (i, piece) in self.pattern.pieces.iter().enumerate() {
             let label = format!(
-                "{}{}  ({} pts)",
+                "{}{}{}  ({} pts)",
                 piece.name,
                 if piece.closed { "" } else { " [open]" },
+                if self.pattern.is_linked(i) { " ↔" } else { "" },
                 piece.points.len()
             );
             if ui.selectable_label(self.selected_piece == Some(i), label).clicked() {
@@ -1995,6 +2134,10 @@ impl App {
                 ui.label(format!("Area: {}", self.settings.units.format_area(piece.area().abs())));
             }
             ui.label(format!("Perimeter: {}", self.settings.units.format(piece.perimeter())));
+            self.symmetry_panel(ui, pi);
+            if self.pattern.pieces[pi].closed {
+                self.allowance_panel(ui, pi);
+            }
             self.transform_panel(ui);
             self.segments_panel(ui, pi);
         }
@@ -2060,6 +2203,100 @@ impl App {
         }
     }
 
+    /// What piece `pi` is symmetrically linked with, and a button to unlink it.
+    fn symmetry_panel(&mut self, ui: &mut egui::Ui, pi: usize) {
+        let pieces = &self.pattern.pieces;
+        let links: Vec<String> = (self.pattern.symmetries.iter().filter(|s| s.touches(pi)))
+            .map(|s| {
+                let other = &pieces[if s.a == pi { s.b } else { s.a }].name;
+                match (s.is_halves(), s.axis().is_some()) {
+                    (true, _) => "Symmetric halves".to_owned(),
+                    (false, true) => format!("Mirrors {other}"),
+                    (false, false) => format!("Linked copy of {other}"),
+                }
+            })
+            .collect();
+        if links.is_empty() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("↔ {}", links.join(", ")))
+                .on_hover_text("Edits to one side are mirrored onto the other");
+            if ui.small_button("Unlink").on_hover_text("Edit the sides independently from now on").clicked() {
+                self.unlink_selected();
+            }
+        });
+    }
+
+    /// Whole-piece seam allowance: add, edit or remove it, and reset
+    /// per-segment widths back to it.
+    fn allowance_panel(&mut self, ui: &mut egui::Ui, pi: usize) {
+        let units = self.settings.units;
+        let piece = &self.pattern.pieces[pi];
+        let overrides = piece.points.iter().filter(|p| p.allowance.is_some()).count();
+        let mut width = piece.seam_allowance;
+        let mut begin_edit = false;
+        let mut changed = false;
+        let mut set = None;
+        let mut reset = false;
+        ui.horizontal(|ui| {
+            ui.label("Seam allowance");
+            if !piece.has_allowance() {
+                let label = format!("Add {}", units.format(self.settings.seam_allowance));
+                if ui.button(label).on_hover_text("Add seam allowance around the whole piece").clicked() {
+                    set = Some(self.settings.seam_allowance);
+                }
+                return;
+            }
+            let resp = length_value(ui, &mut width, units, 0.0..=500.0)
+                .on_hover_text("Allowance of every segment that doesn't have its own");
+            begin_edit |= resp.drag_started() || resp.gained_focus();
+            changed |= resp.changed();
+            if ui.button("Remove").on_hover_text("Remove the seam allowance from every segment").clicked() {
+                set = Some(0.0);
+            }
+        });
+        if overrides > 0 {
+            ui.horizontal(|ui| {
+                ui.label(format!("{overrides} segment(s) have their own width"));
+                reset = ui
+                    .button("Reset")
+                    .on_hover_text("Give every segment the piece's seam allowance")
+                    .clicked();
+            });
+        }
+        if begin_edit {
+            self.checkpoint();
+        }
+        if changed {
+            self.pattern.pieces[pi].seam_allowance = width;
+        }
+        if let Some(w) = set {
+            self.set_piece_allowance(pi, w);
+        }
+        if reset {
+            self.checkpoint();
+            self.pattern.pieces[pi].clear_allowance_overrides();
+        }
+    }
+
+    /// Give the whole piece seam allowance `width` (0 removes it), dropping
+    /// per-segment widths.
+    fn set_piece_allowance(&mut self, pi: usize, width: f64) {
+        self.checkpoint();
+        let piece = &mut self.pattern.pieces[pi];
+        piece.seam_allowance = width;
+        piece.clear_allowance_overrides();
+    }
+
+    /// Set (or with `None`, reset to the piece default) the seam allowance
+    /// of every selected segment.
+    fn set_selected_allowance(&mut self, width: Option<f64>) {
+        for &(pi, seg) in &self.selected_segments {
+            self.pattern.pieces[pi].points[seg].allowance = width;
+        }
+    }
+
     fn transform_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -2085,27 +2322,55 @@ impl App {
         });
         ui.horizontal(|ui| {
             if ui.button("Duplicate").on_hover_text("Ctrl+D").clicked() {
-                self.duplicate_selected();
+                self.duplicate_selected(false);
             }
             if ui
-                .add_enabled(self.can_unfold(), egui::Button::new("Unfold"))
-                .on_hover_text("Mirror the piece across the selected straight edge and merge the halves (U)")
-                .on_disabled_hover_text("Select a straight edge of a closed piece first")
+                .button("Mirrored copy")
+                .on_hover_text(
+                    "Duplicate, flip horizontally and link the two pieces: edits to either are mirrored \
+                     onto the other (Ctrl+Shift+D)",
+                )
                 .clicked()
             {
-                self.unfold_selected();
+                self.duplicate_selected(true);
+            }
+        });
+        ui.horizontal(|ui| {
+            let can = self.can_unfold();
+            let disabled = "Select a straight edge of a closed piece first";
+            if ui
+                .add_enabled(can, egui::Button::new("Unfold"))
+                .on_hover_text("Mirror the piece across the selected straight edge and merge the halves (U)")
+                .on_disabled_hover_text(disabled)
+                .clicked()
+            {
+                self.unfold_selected(false);
+            }
+            if ui
+                .add_enabled(can, egui::Button::new("Unfold symmetric"))
+                .on_hover_text(
+                    "Unfold and keep the halves linked across the fold: edits to one half are mirrored \
+                     onto the other (Shift+U)",
+                )
+                .on_disabled_hover_text(disabled)
+                .clicked()
+            {
+                self.unfold_selected(true);
             }
         });
     }
 
     fn segments_panel(&mut self, ui: &mut egui::Ui, pi: usize) {
         let piece = &self.pattern.pieces[pi];
-        let rows: Vec<(usize, usize, f64)> = (0..piece.segment_count())
+        // (start, end, length, allowance, has its own allowance)
+        let rows: Vec<(usize, usize, f64, f64, bool)> = (0..piece.segment_count())
             .map(|seg| {
                 let (a, b) = piece.segment_ends(seg);
-                (a, b, piece.segment_length(seg))
+                let own = piece.points[seg].allowance.is_some();
+                (a, b, piece.segment_length(seg), piece.segment_allowance(seg), own)
             })
             .collect();
+        let allowances = piece.closed;
         if rows.is_empty() {
             return;
         }
@@ -2114,6 +2379,7 @@ impl App {
         let mut select = None;
         let mut begin_edit = false;
         let mut change = None;
+        let mut allowance_change = None;
         egui::CollapsingHeader::new(format!("Segments ({})", rows.len()))
             .default_open(true)
             .show(ui, |ui| {
@@ -2122,8 +2388,14 @@ impl App {
                     ui.radio_value(&mut self.settings.length_moves_start, false, "end point");
                     ui.radio_value(&mut self.settings.length_moves_start, true, "start point");
                 });
-                egui::Grid::new("segments").num_columns(2).striped(true).show(ui, |ui| {
-                    for (seg, &(a, b, len)) in rows.iter().enumerate() {
+                egui::Grid::new("segments").num_columns(4).striped(true).show(ui, |ui| {
+                    if allowances {
+                        ui.label("");
+                        ui.label("Length");
+                        ui.label("Allowance");
+                        ui.end_row();
+                    }
+                    for (seg, &(a, b, len, width, own)) in rows.iter().enumerate() {
                         let label = format!("{} → {}", a + 1, b + 1);
                         let selected = self.selected_segments.contains(&(pi, seg));
                         if ui.selectable_label(selected, label).clicked() {
@@ -2134,6 +2406,24 @@ impl App {
                         begin_edit |= resp.drag_started() || resp.gained_focus();
                         if resp.changed() {
                             change = Some((seg, v));
+                        }
+                        if allowances {
+                            let mut w = width;
+                            let resp = length_value(ui, &mut w, units, 0.0..=500.0).on_hover_text(if own {
+                                "This segment's own seam allowance"
+                            } else {
+                                "The piece's seam allowance; edit to give this segment its own"
+                            });
+                            begin_edit |= resp.drag_started() || resp.gained_focus();
+                            if resp.changed() {
+                                allowance_change = Some((seg, Some(w)));
+                            }
+                            if own
+                                && ui.small_button("↺").on_hover_text("Use the piece's seam allowance").clicked()
+                            {
+                                begin_edit = true;
+                                allowance_change = Some((seg, None));
+                            }
                         }
                         ui.end_row();
                     }
@@ -2157,6 +2447,48 @@ impl App {
         }
         if let Some((seg, len)) = change {
             self.pattern.pieces[pi].set_segment_length(seg, len, self.settings.length_moves_start);
+        }
+        if let Some((seg, width)) = allowance_change {
+            self.pattern.pieces[pi].points[seg].allowance = width;
+        }
+        if allowances {
+            self.selected_allowance_row(ui);
+        }
+    }
+
+    /// Seam allowance for all selected segments at once.
+    fn selected_allowance_row(&mut self, ui: &mut egui::Ui) {
+        let Some(&(p0, s0)) = self.selected_segments.first() else { return };
+        if !self.selected_segments.iter().all(|&(p, _)| self.pattern.pieces[p].closed) {
+            return;
+        }
+        let units = self.settings.units;
+        let mut width = self.pattern.pieces[p0].segment_allowance(s0);
+        let any_own = self.selected_segments.iter().any(|&(p, s)| self.pattern.pieces[p].points[s].allowance.is_some());
+        let mut begin_edit = false;
+        let mut set = None;
+        ui.horizontal(|ui| {
+            ui.label(format!("Allowance of {} selected", self.selected_segments.len()));
+            let resp = length_value(ui, &mut width, units, 0.0..=500.0)
+                .on_hover_text("Type or drag to set the seam allowance of every selected segment; 0 for none");
+            begin_edit |= resp.drag_started() || resp.gained_focus();
+            if resp.changed() {
+                set = Some(Some(width));
+            }
+            if ui
+                .add_enabled(any_own, egui::Button::new("Piece default"))
+                .on_hover_text("Use the piece's seam allowance on the selected segments")
+                .clicked()
+            {
+                begin_edit = true;
+                set = Some(None);
+            }
+        });
+        if begin_edit {
+            self.checkpoint();
+        }
+        if let Some(width) = set {
+            self.set_selected_allowance(width);
         }
     }
 
@@ -2240,6 +2572,18 @@ impl App {
 
                 ui.label("Segment lengths");
                 ui.checkbox(&mut s.show_lengths, "Label every segment (L)");
+                ui.end_row();
+
+                ui.label("Seam allowance");
+                ui.vertical(|ui| {
+                    ui.checkbox(&mut s.show_allowance, "Show cut line");
+                    ui.horizontal(|ui| {
+                        ui.label("Default width");
+                        let units = s.units;
+                        length_value(ui, &mut s.seam_allowance, units, 0.0..=500.0)
+                            .on_hover_text("Width given to a piece by \"Add seam allowance\"");
+                    });
+                });
                 ui.end_row();
 
                 ui.label("Snapping");
@@ -2525,6 +2869,7 @@ impl eframe::App for App {
             self.status.clear();
         }
         self.run_mcp_jobs();
+        let frame_start = self.pattern.clone();
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
             if self.palette.is_open() {
                 self.palette.close();
@@ -2542,9 +2887,13 @@ impl eframe::App for App {
         egui::Panel::left("side").default_size(230.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
         });
-        egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui));
+        egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui, &frame_start));
         self.settings_window(&ctx);
         self.sync_mcp_server();
         self.show_palette(&ctx);
+        // Edits made after the canvas was painted (e.g. from the palette).
+        if self.mirror_edits(&frame_start) {
+            ctx.request_repaint();
+        }
     }
 }
