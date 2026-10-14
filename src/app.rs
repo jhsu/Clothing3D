@@ -14,7 +14,8 @@ use crate::settings::Settings;
 use crate::units::Units;
 use crate::model::{Isometry, Pattern, Piece, Point, PointKind, Vec2, triangulate};
 use crate::sewing::{EdgeSpan, OutlinePos, Seam, point_at_fraction};
-use crate::view::View;
+use crate::view::{Projection, View};
+use crate::viewport::{self, Viewport};
 
 /// Pick radius for points and lines, in screen pixels.
 const PICK_PX: f32 = 8.0;
@@ -83,6 +84,8 @@ enum Command {
     SaveAs,
     ExportDxf,
     Fit,
+    SplitView,
+    CloseView,
     ToggleGrid,
     ToggleSnapPoints,
     ToggleMatchSnap,
@@ -124,6 +127,8 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::SaveAs, "Save pattern as…", ""),
     (Command::ExportDxf, "Export DXF (AAMA/ASTM)…", ""),
     (Command::Fit, "Fit view to pattern", "F"),
+    (Command::SplitView, "Split view", ""),
+    (Command::CloseView, "Close view", ""),
     (Command::ToggleGrid, "Toggle grid snapping", "G"),
     (Command::ToggleSnapPoints, "Toggle snap to points", ""),
     (Command::ToggleMatchSnap, "Toggle snap to matching seam length", ""),
@@ -160,9 +165,9 @@ enum Drag {
     /// Bending a segment: the curve point at `t` follows the cursor, starting
     /// from the segment's handles when the drag began.
     Bend { piece: usize, seg: usize, t: f64, grab: Vec2, start: (Vec2, Vec2) },
-    /// Rectangle selection between two screen positions; `additive` (Shift)
-    /// adds to the current selection instead of replacing it.
-    Marquee { start: Pos2, end: Pos2, additive: bool },
+    /// Rectangle selection between two screen positions of `viewport`;
+    /// `additive` (Shift) adds to the current selection instead of replacing it.
+    Marquee { viewport: usize, start: Pos2, end: Pos2, additive: bool },
 }
 
 /// Progress through the four clicks of the free sewing tool.
@@ -189,7 +194,16 @@ struct PointRef {
 struct Session {
     pattern: Pattern,
     file: Option<PathBuf>,
-    view: View,
+    viewports: Vec<Viewport>,
+    active_viewport: usize,
+    /// Camera of sessions saved before there were several viewports.
+    #[serde(skip_serializing, deserialize_with = "legacy_view")]
+    view: Option<View>,
+}
+
+/// Old sessions stored the camera as a plain `view: (...)`, not an `Option`.
+fn legacy_view<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<View>, D::Error> {
+    View::deserialize(d).map(Some)
 }
 
 impl Default for Session {
@@ -200,7 +214,10 @@ impl Default for Session {
 
 pub struct App {
     pattern: Pattern,
-    view: View,
+    /// Windows onto the pattern, laid out side by side; never empty.
+    viewports: Vec<Viewport>,
+    /// The viewport last hovered: keyboard view commands apply to it.
+    active_viewport: usize,
     tool: Tool,
     selected_piece: Option<usize>,
     /// Selected points; Shift+click adds or removes.
@@ -229,7 +246,6 @@ pub struct App {
     file: Option<PathBuf>,
     status: String,
     cursor_world: Option<Vec2>,
-    fit_requested: bool,
     palette: Palette,
     /// MCP server for AI agents, while enabled in the settings.
     mcp: Option<McpServer>,
@@ -245,7 +261,8 @@ impl Default for App {
     fn default() -> Self {
         Self {
             pattern: Pattern::default(),
-            view: View::default(),
+            viewports: vec![Viewport::default()],
+            active_viewport: 0,
             tool: Tool::Draw,
             selected_piece: None,
             selected_points: Vec::new(),
@@ -265,7 +282,6 @@ impl Default for App {
             file: None,
             status: String::new(),
             cursor_world: None,
-            fit_requested: false,
             palette: Palette::default(),
             mcp: None,
             mcp_error: None,
@@ -302,14 +318,22 @@ impl App {
         Session {
             pattern: self.pattern.clone(),
             file: self.file.clone(),
-            view: self.view,
+            viewports: self.viewports.clone(),
+            active_viewport: self.active_viewport,
+            view: None,
         }
     }
 
     fn restore(&mut self, s: Session) {
         self.pattern = s.pattern;
         self.file = s.file;
-        self.view = s.view;
+        // Only old sessions have `view`; their `viewports` is just the default.
+        self.viewports = match (s.view, s.viewports) {
+            (Some(view), _) => vec![Viewport::pattern(view)],
+            (None, v) if !v.is_empty() => v,
+            _ => vec![Viewport::default()],
+        };
+        self.active_viewport = s.active_viewport.min(self.viewports.len() - 1);
         // A stale or hand-edited session must not leave dangling indices.
         self.validate_selection();
     }
@@ -387,7 +411,7 @@ impl App {
                 self.after_history_change();
                 self.status = format!("Opened {}", path.display());
                 self.file = Some(path);
-                self.fit_requested = true;
+                self.fit_all();
             }
             Err(e) => self.status = format!("Open failed: {e}"),
         }
@@ -554,14 +578,14 @@ impl App {
     }
 
     /// Visible handle under `screen`, if any.
-    fn pick_handle(&self, rect: Rect, screen: Pos2) -> Option<(PointRef, HandleSide)> {
+    fn pick_handle(&self, proj: Projection, screen: Pos2) -> Option<(PointRef, HandleSide)> {
         self.handle_points().into_iter().find_map(|r| {
             let piece = &self.pattern.pieces[r.piece];
             let pos = piece.points[r.point].pos;
             let (hin, hout) = piece.visible_handles(r.point);
             [(hout, HandleSide::Out), (hin, HandleSide::In)].into_iter().find_map(|(h, side)| {
                 let h = h?;
-                (self.view.to_screen(rect, pos + h).distance(screen) <= PICK_PX).then_some((r, side))
+                (proj.to_screen(pos + h).distance(screen) <= PICK_PX).then_some((r, side))
             })
         })
     }
@@ -620,7 +644,7 @@ impl App {
 
     /// Select the points inside screen rectangle `area` (added to the
     /// selection when `additive`).
-    fn select_in_rect(&mut self, viewport: Rect, area: Rect, additive: bool) {
+    fn select_in_rect(&mut self, proj: Projection, area: Rect, additive: bool) {
         if !additive {
             self.clear_selection();
         }
@@ -629,7 +653,7 @@ impl App {
         for (pi, piece) in self.pattern.pieces.iter().enumerate() {
             for (i, p) in piece.points.iter().enumerate() {
                 let r = PointRef { piece: pi, point: i };
-                if area.contains(self.view.to_screen(viewport, p.pos)) && !self.selected_points.contains(&r) {
+                if area.contains(proj.to_screen(p.pos)) && !self.selected_points.contains(&r) {
                     self.selected_points.push(r);
                 }
             }
@@ -787,25 +811,65 @@ impl App {
         })
     }
 
-    fn fit_view(&mut self, rect: Rect) {
+    /// Frame the whole pattern in viewport `vi`, laid out in `rect`.
+    fn fit_view(&mut self, vi: usize, rect: Rect) {
         let Some((min, max)) = self.pattern.pieces.iter().filter_map(|p| p.outer_bounds()).reduce(
             |(lo, hi), (a, b)| {
                 (Vec2::new(lo.x.min(a.x), lo.y.min(a.y)), Vec2::new(hi.x.max(b.x), hi.y.max(b.y)))
             },
         ) else {
-            self.view = View::default();
+            if let Some(view) = self.viewports[vi].camera_mut() {
+                *view = View::default();
+            }
             return;
         };
-        self.view.fit(rect, min, max);
+        if let Some(view) = self.viewports[vi].camera_mut() {
+            view.fit(rect, min, max);
+        }
+    }
+
+    fn fit_active(&mut self) {
+        self.viewports[self.active_viewport].fit_requested = true;
+    }
+
+    fn fit_all(&mut self) {
+        for v in &mut self.viewports {
+            v.fit_requested = true;
+        }
+    }
+
+    /// Open a second window onto the pattern beside the active one, starting
+    /// from the same camera.
+    fn split_view(&mut self) {
+        let copy = self.viewports[self.active_viewport].clone();
+        self.viewports.insert(self.active_viewport + 1, copy);
+        self.active_viewport += 1;
+    }
+
+    /// Close the active viewport, keeping at least one.
+    fn close_view(&mut self) {
+        if self.viewports.len() <= 1 {
+            return;
+        }
+        let vi = self.active_viewport;
+        self.viewports.remove(vi);
+        if let Some(Drag::Marquee { viewport, .. }) = &mut self.dragging {
+            if *viewport == vi {
+                self.dragging = None;
+            } else if *viewport > vi {
+                *viewport -= 1;
+            }
+        }
+        self.active_viewport = vi.min(self.viewports.len() - 1);
     }
 
     // --------------------------------------------------------------- picking
 
-    fn pick_point(&self, rect: Rect, screen: Pos2) -> Option<PointRef> {
+    fn pick_point(&self, proj: Projection, screen: Pos2) -> Option<PointRef> {
         let mut best: Option<(PointRef, f32)> = None;
         for (pi, piece) in self.pattern.pieces.iter().enumerate() {
             for (i, p) in piece.points.iter().enumerate() {
-                let d = self.view.to_screen(rect, p.pos).distance(screen);
+                let d = proj.to_screen(p.pos).distance(screen);
                 if d <= PICK_PX && best.is_none_or(|b| d < b.1) {
                     best = Some((PointRef { piece: pi, point: i }, d));
                 }
@@ -815,9 +879,9 @@ impl App {
     }
 
     /// Closest outline location within pick range: `(piece, segment, t, pos)`.
-    fn pick_outline(&self, rect: Rect, screen: Pos2) -> Option<(usize, usize, f64, Vec2)> {
-        let world = self.view.to_world(rect, screen);
-        let max = f64::from(PICK_PX) / self.view.zoom;
+    fn pick_outline(&self, proj: Projection, screen: Pos2) -> Option<(usize, usize, f64, Vec2)> {
+        let world = proj.to_world(screen);
+        let max = f64::from(PICK_PX) / proj.zoom();
         self.pattern
             .pieces
             .iter()
@@ -830,22 +894,22 @@ impl App {
 
     /// Outline location for sewing: snaps to nearby points, else the closest
     /// outline position within pick range.
-    fn pick_outline_pos(&self, rect: Rect, screen: Pos2) -> Option<(usize, OutlinePos)> {
-        if let Some(r) = self.pick_point(rect, screen) {
+    fn pick_outline_pos(&self, proj: Projection, screen: Pos2) -> Option<(usize, OutlinePos)> {
+        if let Some(r) = self.pick_point(proj, screen) {
             let piece = &self.pattern.pieces[r.piece];
             if piece.segment_count() > 0 {
                 return Some((r.piece, piece.point_pos(r.point)));
             }
         }
-        self.pick_outline(rect, screen).map(|(pi, seg, t, _)| (pi, OutlinePos::new(seg, t)))
+        self.pick_outline(proj, screen).map(|(pi, seg, t, _)| (pi, OutlinePos::new(seg, t)))
     }
 
     /// Topmost piece whose outline is near `screen` or whose fill contains it.
-    fn pick_piece(&self, rect: Rect, screen: Pos2) -> Option<usize> {
-        if let Some((pi, ..)) = self.pick_outline(rect, screen) {
+    fn pick_piece(&self, proj: Projection, screen: Pos2) -> Option<usize> {
+        if let Some((pi, ..)) = self.pick_outline(proj, screen) {
             return Some(pi);
         }
-        let world = self.view.to_world(rect, screen);
+        let world = proj.to_world(screen);
         self.pattern.pieces.iter().rposition(|p| p.contains(world))
     }
 
@@ -876,14 +940,14 @@ impl App {
     }
 
     /// Snap a world position to existing points (excluding `skip`) or the grid.
-    fn snap(&self, rect: Rect, screen: Pos2, skip: Option<PointRef>) -> Vec2 {
+    fn snap(&self, proj: Projection, screen: Pos2, skip: Option<PointRef>) -> Vec2 {
         if self.settings.snap_points
-            && let Some(r) = self.pick_point(rect, screen)
+            && let Some(r) = self.pick_point(proj, screen)
             && Some(r) != skip
         {
             return self.pattern.pieces[r.piece].points[r.point].pos;
         }
-        let w = self.view.to_world(rect, screen);
+        let w = proj.to_world(screen);
         if self.settings.snap_grid && self.settings.snap_step > 0.0 {
             let s = self.settings.snap_step;
             Vec2::new((w.x / s).round() * s, (w.y / s).round() * s)
@@ -894,51 +958,74 @@ impl App {
 
     // -------------------------------------------------------------- viewport
 
-    /// The canvas. `frame_start` is the pattern at the start of the frame,
-    /// for mirroring this frame's edits before painting.
-    fn viewport(&mut self, ui: &mut egui::Ui, frame_start: &Pattern) {
-        let (response, painter) =
-            ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        let rect = response.rect;
-
-        if std::mem::take(&mut self.fit_requested) {
-            self.fit_view(rect);
+    /// The canvas area: lays the viewports out side by side, lets each
+    /// handle input, then paints them all. `frame_start` is the pattern at
+    /// the start of the frame, for mirroring this frame's edits before painting.
+    fn viewports(&mut self, ui: &mut egui::Ui, frame_start: &Pattern) {
+        let area = ui.available_rect_before_wrap();
+        let rects = viewport::layout(area, self.viewports.len());
+        self.cursor_world = None;
+        let mut frames = Vec::new();
+        for (vi, rect) in rects.into_iter().enumerate() {
+            let response = ui.interact(rect, ui.id().with(("viewport", vi)), Sense::click_and_drag());
+            if let Some(proj) = self.viewport_input(vi, &response) {
+                frames.push((vi, proj, response.hover_pos()));
+            }
         }
+        self.mirror_edits(frame_start);
+        let painter = ui.painter_at(area);
+        painter.rect_filled(area, 0.0, Color32::from_gray(160));
+        for (vi, proj, hover) in frames {
+            self.paint(vi, &painter, proj, hover);
+        }
+    }
+
+    /// Navigation and tool input for viewport `vi`. Returns its projection
+    /// for painting, if it shows the flat pattern.
+    fn viewport_input(&mut self, vi: usize, response: &egui::Response) -> Option<Projection> {
+        let rect = response.rect;
+        if response.hovered() {
+            self.active_viewport = vi;
+        }
+        if std::mem::take(&mut self.viewports[vi].fit_requested) {
+            self.fit_view(vi, rect);
+        }
+        let view = self.viewports[vi].camera_mut()?;
 
         // Navigation: scroll/pinch zooms at cursor, middle/right drag pans.
         if let Some(hover) = response.hover_pos() {
-            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let (scroll, pinch) = response.ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
             let factor = f64::from(pinch) * (f64::from(scroll) * 0.002).exp();
             if factor != 1.0 {
-                self.view.zoom_at(rect, hover, factor);
+                view.zoom_at(rect, hover, factor);
             }
         }
         if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary)
         {
             let d = response.drag_delta();
-            self.view.pan(d.x, d.y);
+            view.pan(d.x, d.y);
+        }
+        let proj = Projection { view: *view, rect };
+
+        if let Some(hover) = response.hover_pos() {
+            self.cursor_world = Some(proj.to_world(hover));
         }
 
-        let hover = response.hover_pos();
-        self.cursor_world = hover.map(|h| self.view.to_world(rect, h));
-
         match self.tool {
-            Tool::Select | Tool::Curve => self.select_tool(&response, rect),
-            Tool::Draw => self.draw_tool(&response, rect),
-            Tool::AddPoint => self.add_point_tool(&response, rect),
-            Tool::Sew => self.sew_tool(&response, rect),
+            Tool::Select | Tool::Curve => self.select_tool(vi, response, proj),
+            Tool::Draw => self.draw_tool(response, proj),
+            Tool::AddPoint => self.add_point_tool(response, proj),
+            Tool::Sew => self.sew_tool(response, proj),
         }
 
         if response.secondary_clicked() {
             self.context_target = response
                 .interact_pointer_pos()
-                .and_then(|pos| self.pick_outline(rect, pos))
+                .and_then(|pos| self.pick_outline(proj, pos))
                 .map(|(pi, seg, t, _)| (pi, seg, t));
         }
         response.context_menu(|ui| self.viewport_context_menu(ui));
-
-        self.mirror_edits(frame_start);
-        self.paint(&painter, rect, hover);
+        Some(proj)
     }
 
     /// Right-click menu: segment actions when an edge was clicked.
@@ -967,7 +1054,7 @@ impl App {
             ui.separator();
         }
         if ui.button("Fit to pattern").clicked() {
-            self.fit_requested = true;
+            self.fit_active();
             ui.close();
         }
         if ui.button("Command palette…").clicked() {
@@ -976,7 +1063,7 @@ impl App {
         }
     }
 
-    fn select_tool(&mut self, response: &egui::Response, rect: Rect) {
+    fn select_tool(&mut self, vi: usize, response: &egui::Response, proj: Projection) {
         let (shift, alt, ctrl) =
             response.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt, i.modifiers.command));
         if response.drag_started_by(PointerButton::Primary)
@@ -984,11 +1071,11 @@ impl App {
         {
             // Ctrl forces a selection rectangle even when starting over a piece.
             if ctrl {
-                self.dragging = Some(Drag::Marquee { start: pos, end: pos, additive: shift });
-            } else if let Some((point, side)) = self.pick_handle(rect, pos) {
+                self.dragging = Some(Drag::Marquee { viewport: vi, start: pos, end: pos, additive: shift });
+            } else if let Some((point, side)) = self.pick_handle(proj, pos) {
                 self.checkpoint();
                 self.dragging = Some(Drag::Handle { point, side });
-            } else if let Some(r) = self.pick_point(rect, pos) {
+            } else if let Some(r) = self.pick_point(proj, pos) {
                 // Dragging an unselected point selects it (Shift adds it) first.
                 if !self.selected_points.contains(&r) {
                     if shift {
@@ -1004,26 +1091,26 @@ impl App {
                     self.selected_points.iter().map(|&q| (q, pieces[q.piece].points[q.point].pos)).collect();
                 self.dragging = Some(Drag::Points { grabbed: r, original });
             } else if self.tool == Tool::Curve
-                && let Some((pi, seg, t, _)) = self.pick_outline(rect, pos)
+                && let Some((pi, seg, t, _)) = self.pick_outline(proj, pos)
             {
                 self.checkpoint();
                 self.select_segment(pi, seg, false);
                 let start = self.pattern.pieces[pi].segment_handles(seg);
-                let grab = self.view.to_world(rect, pos);
+                let grab = proj.to_world(pos);
                 self.dragging = Some(Drag::Bend { piece: pi, seg, t, grab, start });
             } else if self.tool == Tool::Select
-                && let Some(pi) = self.pick_piece(rect, pos)
+                && let Some(pi) = self.pick_piece(proj, pos)
             {
                 self.checkpoint();
-                let start = self.view.to_world(rect, pos);
+                let start = proj.to_world(pos);
                 self.dragging = Some(Drag::Piece { piece: pi, start, moved: Vec2::default() });
                 if self.selected_piece != Some(pi) {
                     self.clear_selection();
                     self.selected_piece = Some(pi);
                 }
-            } else if self.pick_outline(rect, pos).is_none() {
+            } else if self.pick_outline(proj, pos).is_none() {
                 // Empty canvas (or a piece's fill in the curve tool): rectangle selection.
-                self.dragging = Some(Drag::Marquee { start: pos, end: pos, additive: shift });
+                self.dragging = Some(Drag::Marquee { viewport: vi, start: pos, end: pos, additive: shift });
             }
         }
         if response.dragged_by(PointerButton::Primary)
@@ -1037,33 +1124,33 @@ impl App {
                 Some(Drag::Points { grabbed, original }) => {
                     let start = original.iter().find(|(q, _)| q == grabbed).map(|(_, p)| *p);
                     if let Some(start) = start {
-                        let d = self.snap(rect, pos, Some(*grabbed)) - start;
+                        let d = self.snap(proj, pos, Some(*grabbed)) - start;
                         for &(q, o) in original {
                             self.pattern.pieces[q.piece].points[q.point].pos = o + d;
                         }
                     }
                 }
                 &Some(Drag::Piece { piece, start, moved }) => {
-                    let d = self.snap_offset(self.view.to_world(rect, pos) - start);
+                    let d = self.snap_offset(proj.to_world(pos) - start);
                     self.pattern.transform_piece(piece, &Isometry::translation(d - moved));
                     self.dragging = Some(Drag::Piece { piece, start, moved: d });
                 }
                 &Some(Drag::Handle { point, side }) => {
                     let piece = &mut self.pattern.pieces[point.piece];
-                    let offset = self.view.to_world(rect, pos) - piece.points[point.point].pos;
+                    let offset = proj.to_world(pos) - piece.points[point.point].pos;
                     piece.set_handle(point.point, side, offset, !alt);
                 }
                 &Some(Drag::Bend { piece, seg, t, grab, start }) => {
-                    let delta = self.view.to_world(rect, pos) - grab;
+                    let delta = proj.to_world(pos) - grab;
                     self.pattern.pieces[piece].bend_segment(seg, t, start, delta);
                 }
                 None => {}
             }
         }
         if response.drag_stopped()
-            && let Some(Drag::Marquee { start, end, additive }) = self.dragging.take()
+            && let Some(Drag::Marquee { start, end, additive, .. }) = self.dragging.take()
         {
-            self.select_in_rect(rect, Rect::from_two_pos(start, end), additive);
+            self.select_in_rect(proj, Rect::from_two_pos(start, end), additive);
         }
         if response.drag_stopped() {
             self.dragging = None;
@@ -1071,7 +1158,7 @@ impl App {
 
         if response.double_clicked()
             && let Some(pos) = response.interact_pointer_pos()
-            && let Some((pi, seg, t, _)) = self.pick_outline(rect, pos)
+            && let Some((pi, seg, t, _)) = self.pick_outline(proj, pos)
         {
             self.checkpoint();
             if self.tool == Tool::Curve {
@@ -1085,11 +1172,11 @@ impl App {
         } else if response.clicked_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
         {
-            if let Some(r) = self.pick_point(rect, pos) {
+            if let Some(r) = self.pick_point(proj, pos) {
                 self.select_point(r, shift);
-            } else if let Some((pi, seg, ..)) = self.pick_outline(rect, pos) {
+            } else if let Some((pi, seg, ..)) = self.pick_outline(proj, pos) {
                 self.select_segment(pi, seg, shift);
-            } else if let Some(pi) = self.pick_piece(rect, pos) {
+            } else if let Some(pi) = self.pick_piece(proj, pos) {
                 if !shift {
                     self.clear_selection();
                 }
@@ -1100,7 +1187,7 @@ impl App {
         }
     }
 
-    fn draw_tool(&mut self, response: &egui::Response, rect: Rect) {
+    fn draw_tool(&mut self, response: &egui::Response, proj: Projection) {
         if !response.clicked_by(PointerButton::Primary) {
             return;
         }
@@ -1109,7 +1196,7 @@ impl App {
         // Clicking the first point of the piece being drawn closes it.
         if let Some(idx) = self.drawing {
             let piece = &self.pattern.pieces[idx];
-            let first = self.view.to_screen(rect, piece.points[0].pos);
+            let first = proj.to_screen(piece.points[0].pos);
             if piece.points.len() >= 3 && first.distance(pos) <= PICK_PX {
                 self.checkpoint();
                 self.finish_drawing(true);
@@ -1118,7 +1205,7 @@ impl App {
             }
         }
 
-        let w = self.snap(rect, pos, None);
+        let w = self.snap(proj, pos, None);
         self.checkpoint();
         let idx = *self.drawing.get_or_insert_with(|| {
             let n = self.pattern.pieces.len() + 1;
@@ -1131,10 +1218,10 @@ impl App {
         self.select_point(r, false);
     }
 
-    fn add_point_tool(&mut self, response: &egui::Response, rect: Rect) {
+    fn add_point_tool(&mut self, response: &egui::Response, proj: Projection) {
         if response.clicked_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
-            && let Some((pi, seg, t, _)) = self.pick_outline(rect, pos)
+            && let Some((pi, seg, t, _)) = self.pick_outline(proj, pos)
         {
             self.checkpoint();
             let idx = self.pattern.insert_point(pi, seg, t);
@@ -1142,7 +1229,7 @@ impl App {
         }
     }
 
-    fn sew_tool(&mut self, response: &egui::Response, rect: Rect) {
+    fn sew_tool(&mut self, response: &egui::Response, proj: Projection) {
         if !response.clicked_by(PointerButton::Primary) {
             return;
         }
@@ -1150,15 +1237,15 @@ impl App {
         let no_snap = response.ctx.input(|i| i.modifiers.alt);
         match self.sew {
             SewState::Idle | SewState::First(_) => {
-                let Some((pi, at)) = self.pick_outline_pos(rect, pos) else { return };
+                let Some((pi, at)) = self.pick_outline_pos(proj, pos) else { return };
                 self.sew = match self.sew {
                     SewState::First(a) => SewState::SecondStart(a, pi, at),
                     _ => SewState::FirstStart(pi, at),
                 };
             }
             SewState::FirstStart(start_piece, _) | SewState::SecondStart(_, start_piece, _) => {
-                let Some((span, _)) = self.pending_span(rect, pos, no_snap) else {
-                    if self.pick_outline_pos(rect, pos).is_some_and(|(pi, _)| pi != start_piece) {
+                let Some((span, _)) = self.pending_span(proj, pos, no_snap) else {
+                    if self.pick_outline_pos(proj, pos).is_some_and(|(pi, _)| pi != start_piece) {
                         self.status = "The end point must be on the same piece as the start".into();
                     }
                     return;
@@ -1195,7 +1282,7 @@ impl App {
 
     /// The edge span that clicking at `screen` would complete while sewing,
     /// and whether it snapped to the matching length.
-    fn pending_span(&self, rect: Rect, screen: Pos2, no_snap: bool) -> Option<(EdgeSpan, bool)> {
+    fn pending_span(&self, proj: Projection, screen: Pos2, no_snap: bool) -> Option<(EdgeSpan, bool)> {
         let (start_piece, start, first) = match self.sew {
             SewState::FirstStart(pi, s) => (pi, s, None),
             SewState::SecondStart(a, pi, s) => (pi, s, Some(a)),
@@ -1208,13 +1295,13 @@ impl App {
             && let Some((span, _)) = self
                 .matching_ends(&a, start_piece, start)
                 .into_iter()
-                .map(|sp| (sp, self.view.to_screen(rect, piece.eval_pos(sp.end)).distance(screen)))
+                .map(|sp| (sp, proj.to_screen(piece.eval_pos(sp.end)).distance(screen)))
                 .filter(|(_, d)| *d <= MATCH_SNAP_PX)
                 .min_by(|x, y| x.1.total_cmp(&y.1))
         {
             return Some((span, true));
         }
-        let (pi, at) = self.pick_outline_pos(rect, screen)?;
+        let (pi, at) = self.pick_outline_pos(proj, screen)?;
         if pi != start_piece || (piece.eval_pos(at) - piece.eval_pos(start)).length() < 1e-6 {
             return None;
         }
@@ -1235,12 +1322,13 @@ impl App {
 
     // -------------------------------------------------------------- painting
 
-    fn paint(&self, painter: &egui::Painter, rect: Rect, hover: Option<Pos2>) {
+    fn paint(&self, vi: usize, painter: &egui::Painter, proj: Projection, hover: Option<Pos2>) {
+        let rect = proj.rect;
         let painter = painter.with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::from_gray(250));
-        self.paint_grid(&painter, rect);
+        self.paint_grid(&painter, proj);
 
-        let to_screen = |p: Vec2| self.view.to_screen(rect, p);
+        let to_screen = |p: Vec2| proj.to_screen(p);
 
         for (pi, piece) in self.pattern.pieces.iter().enumerate() {
             let selected = self.selected_piece == Some(pi);
@@ -1313,7 +1401,7 @@ impl App {
         }
 
         if self.settings.show_lengths {
-            self.paint_segment_lengths(&painter, rect);
+            self.paint_segment_lengths(&painter, proj);
         }
 
         let orange = Color32::from_rgb(240, 120, 0);
@@ -1340,15 +1428,17 @@ impl App {
             paint_label(&painter, mid + egui::vec2(12.0, -14.0), &text, Color32::from_rgb(180, 80, 0));
         }
 
-        self.paint_symmetry(&painter, rect);
-        self.paint_handles(&painter, rect);
+        self.paint_symmetry(&painter, proj);
+        self.paint_handles(&painter, proj);
 
         for (i, seam) in self.pattern.seams.iter().enumerate() {
             let selected = self.selected_seam == Some(i);
-            self.paint_seam(&painter, rect, seam, seam_color(i), selected, true);
+            self.paint_seam(&painter, proj, seam, seam_color(i), selected, true);
         }
-        self.paint_sewing_preview(&painter, rect, hover);
-        if let Some(Drag::Marquee { start, end, .. }) = self.dragging {
+        self.paint_sewing_preview(&painter, proj, hover);
+        if let Some(Drag::Marquee { viewport, start, end, .. }) = self.dragging
+            && viewport == vi
+        {
             let area = Rect::from_two_pos(start, end);
             let blue = Color32::from_rgb(20, 110, 220);
             painter.rect_filled(area, 0.0, blue.gamma_multiply(0.12));
@@ -1359,12 +1449,12 @@ impl App {
         match self.tool {
             Tool::Sew => {}
             Tool::Draw => {
-                let mut w = self.snap(rect, hover, None);
+                let mut w = self.snap(proj, hover, None);
                 let typed = self.settings.units.parse(&self.length_input).filter(|l| *l > 0.0);
                 if let (Some(len), Some(idx)) = (typed, self.drawing)
                     && let Some(last) = self.pattern.pieces[idx].points.last()
                 {
-                    let cursor = self.view.to_world(rect, hover) - last.pos;
+                    let cursor = proj.to_world(hover) - last.pos;
                     if cursor.length() > 1e-9 {
                         w = last.pos + cursor * (len / cursor.length());
                     }
@@ -1391,11 +1481,11 @@ impl App {
             }
             Tool::AddPoint | Tool::Select | Tool::Curve => {
                 if self.tool != Tool::AddPoint
-                    && (self.pick_point(rect, hover).is_some() || self.pick_handle(rect, hover).is_some())
+                    && (self.pick_point(proj, hover).is_some() || self.pick_handle(proj, hover).is_some())
                 {
                     return;
                 }
-                if let Some((_, _, _, pos)) = self.pick_outline(rect, hover) {
+                if let Some((_, _, _, pos)) = self.pick_outline(proj, hover) {
                     painter.circle_stroke(
                         to_screen(pos),
                         4.0,
@@ -1408,7 +1498,7 @@ impl App {
 
     /// Length label beside every segment long enough on screen to fit one,
     /// on the outside of closed pieces.
-    fn paint_segment_lengths(&self, painter: &egui::Painter, rect: Rect) {
+    fn paint_segment_lengths(&self, painter: &egui::Painter, proj: Projection) {
         let units = self.settings.units;
         let color = Color32::from_rgb(70, 70, 90);
         for piece in &self.pattern.pieces {
@@ -1417,7 +1507,7 @@ impl App {
             for seg in 0..piece.segment_count() {
                 let (a, b) = piece.segment_ends(seg);
                 let (pa, pb) = (piece.points[a].pos, piece.points[b].pos);
-                if self.view.to_screen(rect, pa).distance(self.view.to_screen(rect, pb)) < 50.0 {
+                if proj.to_screen(pa).distance(proj.to_screen(pb)) < 50.0 {
                     continue;
                 }
                 let mid = piece.eval_segment(seg, 0.5);
@@ -1429,7 +1519,7 @@ impl App {
                 }
                 // World Y is up and screen Y down, so the right-hand normal flips in y.
                 let n = egui::vec2((dir.y / len * side) as f32, (dir.x / len * side) as f32);
-                let pos = self.view.to_screen(rect, mid) + n * 8.0;
+                let pos = proj.to_screen(mid) + n * 8.0;
                 // Anchor on the side facing the edge so the label never covers it.
                 let anchor = if n.x > 0.5 {
                     Align2::LEFT_CENTER
@@ -1448,7 +1538,7 @@ impl App {
 
     /// The dashed mirror line of every symmetry link, spanning its pieces,
     /// and a ring on the mirror image of each selected point.
-    fn paint_symmetry(&self, painter: &egui::Painter, rect: Rect) {
+    fn paint_symmetry(&self, painter: &egui::Painter, proj: Projection) {
         let pieces = &self.pattern.pieces;
         for s in &self.pattern.symmetries {
             let Some((o, d)) = s.axis() else { continue };
@@ -1457,8 +1547,8 @@ impl App {
             if lo > hi {
                 continue;
             }
-            let margin = 24.0 / self.view.zoom;
-            let ends = [o + d * (lo - margin), o + d * (hi + margin)].map(|p| self.view.to_screen(rect, p));
+            let margin = 24.0 / proj.zoom();
+            let ends = [o + d * (lo - margin), o + d * (hi + margin)].map(|p| proj.to_screen(p));
             let selected = self.selected_piece.is_some_and(|pi| s.touches(pi));
             let color = Color32::from_rgb(120, 60, 200);
             let stroke = if selected { Stroke::new(1.5, color) } else { Stroke::new(1.0, color.gamma_multiply(0.6)) };
@@ -1468,7 +1558,7 @@ impl App {
         for r in &self.selected_points {
             for (piece, point) in self.pattern.mirror_images(r.piece, r.point) {
                 if !self.selected_points.contains(&PointRef { piece, point }) {
-                    let s = self.view.to_screen(rect, pieces[piece].points[point].pos);
+                    let s = proj.to_screen(pieces[piece].points[point].pos);
                     painter.circle_stroke(s, 6.5, Stroke::new(1.5, orange));
                 }
             }
@@ -1477,16 +1567,16 @@ impl App {
 
     /// Handles of the selected points / segment ends. Explicit handles are
     /// solid; automatic ones (curve points without handles) are dashed.
-    fn paint_handles(&self, painter: &egui::Painter, rect: Rect) {
+    fn paint_handles(&self, painter: &egui::Painter, proj: Projection) {
         let color = Color32::from_rgb(120, 60, 200);
         for r in self.handle_points() {
             let piece = &self.pattern.pieces[r.piece];
             let point = &piece.points[r.point];
-            let base = self.view.to_screen(rect, point.pos);
+            let base = proj.to_screen(point.pos);
             let (hin, hout) = piece.visible_handles(r.point);
             for (h, explicit) in [(hin, point.handle_in.is_some()), (hout, point.handle_out.is_some())] {
                 let Some(h) = h else { continue };
-                let tip = self.view.to_screen(rect, point.pos + h);
+                let tip = proj.to_screen(point.pos + h);
                 if explicit {
                     painter.line_segment([base, tip], Stroke::new(1.0, color));
                 } else {
@@ -1503,7 +1593,7 @@ impl App {
     fn paint_span(
         &self,
         painter: &egui::Painter,
-        rect: Rect,
+        proj: Projection,
         span: &EdgeSpan,
         color: Color32,
         width: f32,
@@ -1511,7 +1601,7 @@ impl App {
         let pts: Vec<Pos2> = span
             .polyline(&self.pattern.pieces)
             .into_iter()
-            .map(|p| self.view.to_screen(rect, p))
+            .map(|p| proj.to_screen(p))
             .collect();
         if pts.len() < 2 {
             return pts;
@@ -1532,15 +1622,15 @@ impl App {
     fn paint_seam(
         &self,
         painter: &egui::Painter,
-        rect: Rect,
+        proj: Projection,
         seam: &Seam,
         color: Color32,
         selected: bool,
         badge: bool,
     ) {
         let width = if selected { 4.0 } else { 2.5 };
-        let a = self.paint_span(painter, rect, &seam.a, color, width);
-        let b = self.paint_span(painter, rect, &seam.b, color, width);
+        let a = self.paint_span(painter, proj, &seam.a, color, width);
+        let b = self.paint_span(painter, proj, &seam.b, color, width);
         if a.len() < 2 || b.len() < 2 {
             return;
         }
@@ -1565,7 +1655,7 @@ impl App {
         }
     }
 
-    fn paint_sewing_preview(&self, painter: &egui::Painter, rect: Rect, hover: Option<Pos2>) {
+    fn paint_sewing_preview(&self, painter: &egui::Painter, proj: Projection, hover: Option<Pos2>) {
         if self.tool != Tool::Sew {
             return;
         }
@@ -1573,9 +1663,9 @@ impl App {
         let u = self.settings.units;
         let color = seam_color(self.pattern.seams.len());
         let no_snap = painter.ctx().input(|i| i.modifiers.alt);
-        let pending = hover.and_then(|h| self.pending_span(rect, h, no_snap));
+        let pending = hover.and_then(|h| self.pending_span(proj, h, no_snap));
         let marker = |piece: usize, at: OutlinePos| {
-            let s = self.view.to_screen(rect, pieces[piece].eval_pos(at));
+            let s = proj.to_screen(pieces[piece].eval_pos(at));
             painter.circle_filled(s, 4.0, color);
         };
         // Length readout next to the cursor.
@@ -1586,20 +1676,20 @@ impl App {
             SewState::FirstStart(pi, start) => {
                 marker(pi, start);
                 if let Some((span, _)) = pending {
-                    self.paint_span(painter, rect, &span, color.gamma_multiply(0.6), 2.5);
+                    self.paint_span(painter, proj, &span, color.gamma_multiply(0.6), 2.5);
                     readout = Some((format!("A {}", u.format(span.length(pieces))), Color32::DARK_GRAY));
                 }
             }
             SewState::First(a) => {
-                self.paint_span(painter, rect, &a, color, 2.5);
+                self.paint_span(painter, proj, &a, color, 2.5);
                 readout = Some((format!("A {}", u.format(a.length(pieces))), Color32::DARK_GRAY));
             }
             SewState::SecondStart(a, pi, start) => {
-                self.paint_span(painter, rect, &a, color, 2.5);
+                self.paint_span(painter, proj, &a, color, 2.5);
                 marker(pi, start);
                 if self.settings.snap_match && !no_snap {
                     for end in self.matching_ends(&a, pi, start) {
-                        let s = self.view.to_screen(rect, pieces[pi].eval_pos(end.end));
+                        let s = proj.to_screen(pieces[pi].eval_pos(end.end));
                         let diamond = [(0.0, -7.0), (7.0, 0.0), (0.0, 7.0), (-7.0, 0.0)]
                             .map(|(x, y)| s + egui::vec2(x, y))
                             .to_vec();
@@ -1614,7 +1704,7 @@ impl App {
                 readout = Some((format!("A {}", u.format(la)), Color32::DARK_GRAY));
                 if let Some((b, snapped)) = pending {
                     let seam = Seam { a, b };
-                    self.paint_seam(painter, rect, &seam, color.gamma_multiply(0.6), false, false);
+                    self.paint_seam(painter, proj, &seam, color.gamma_multiply(0.6), false, false);
                     let lb = b.length(pieces);
                     let ok = (la - lb).abs() <= self.settings.seam_tolerance;
                     readout = Some((
@@ -1633,10 +1723,10 @@ impl App {
 
         let hovered = match pending {
             Some((span, _)) => Some((span.piece, span.end)),
-            None => hover.and_then(|h| self.pick_outline_pos(rect, h)),
+            None => hover.and_then(|h| self.pick_outline_pos(proj, h)),
         };
         if let Some((pi, at)) = hovered {
-            let s = self.view.to_screen(rect, pieces[pi].eval_pos(at));
+            let s = proj.to_screen(pieces[pi].eval_pos(at));
             painter.circle_stroke(s, 5.0, Stroke::new(1.5, color));
         }
         if let (Some(h), Some((text, c))) = (hover, readout) {
@@ -1644,28 +1734,29 @@ impl App {
         }
     }
 
-    fn paint_grid(&self, painter: &egui::Painter, rect: Rect) {
-        let (minor, major) = self.settings.units.grid_steps(self.view.zoom, 8.0);
-        let lo = self.view.to_world(rect, rect.left_bottom());
-        let hi = self.view.to_world(rect, rect.right_top());
+    fn paint_grid(&self, painter: &egui::Painter, proj: Projection) {
+        let rect = proj.rect;
+        let (minor, major) = self.settings.units.grid_steps(proj.zoom(), 8.0);
+        let lo = proj.to_world(rect.left_bottom());
+        let hi = proj.to_world(rect.right_top());
 
         for (step, color) in [(minor, Color32::from_gray(235)), (major, Color32::from_gray(210))] {
             let stroke = Stroke::new(1.0, color);
             let mut x = (lo.x / step).floor() * step;
             while x <= hi.x {
-                let sx = self.view.to_screen(rect, Vec2::new(x, 0.0)).x;
+                let sx = proj.to_screen(Vec2::new(x, 0.0)).x;
                 painter.line_segment([Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())], stroke);
                 x += step;
             }
             let mut y = (lo.y / step).floor() * step;
             while y <= hi.y {
-                let sy = self.view.to_screen(rect, Vec2::new(0.0, y)).y;
+                let sy = proj.to_screen(Vec2::new(0.0, y)).y;
                 painter.line_segment([Pos2::new(rect.left(), sy), Pos2::new(rect.right(), sy)], stroke);
                 y += step;
             }
         }
 
-        let origin = self.view.to_screen(rect, Vec2::default());
+        let origin = proj.to_screen(Vec2::default());
         painter.line_segment(
             [Pos2::new(rect.left(), origin.y), Pos2::new(rect.right(), origin.y)],
             Stroke::new(1.0, Color32::from_rgb(230, 150, 150)),
@@ -1756,7 +1847,7 @@ impl App {
             }
         }
         if fit {
-            self.fit_requested = true;
+            self.fit_active();
         }
         if self.tool == Tool::Select && self.dragging.is_none() {
             let (nudge, fine) = ctx.input(|i| {
@@ -1871,6 +1962,7 @@ impl App {
         match cmd {
             Command::ClosePiece => self.drawing.is_some(),
             Command::Undo => !self.undo.is_empty(),
+            Command::CloseView => self.viewports.len() > 1,
             Command::Redo => !self.redo.is_empty(),
             Command::Delete => piece || self.selected_seam.is_some(),
             Command::ToggleCurve | Command::ClearHandles => !self.selected_points.is_empty(),
@@ -1903,7 +1995,9 @@ impl App {
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
             Command::ExportDxf => self.export_dxf(),
-            Command::Fit => self.fit_requested = true,
+            Command::Fit => self.fit_active(),
+            Command::SplitView => self.split_view(),
+            Command::CloseView => self.close_view(),
             Command::ToggleGrid => self.settings.snap_grid = !self.settings.snap_grid,
             Command::ToggleSnapPoints => self.settings.snap_points = !self.settings.snap_points,
             Command::ToggleMatchSnap => self.settings.snap_match = !self.settings.snap_match,
@@ -2058,8 +2152,16 @@ impl App {
                     }
                 });
                 ui.separator();
+                if ui.button("Split view").clicked() {
+                    self.split_view();
+                    ui.close();
+                }
+                if ui.add_enabled(self.viewports.len() > 1, egui::Button::new("Close view")).clicked() {
+                    self.close_view();
+                    ui.close();
+                }
                 if ui.button("Fit to pattern  (F)").clicked() {
-                    self.fit_requested = true;
+                    self.fit_active();
                     ui.close();
                 }
             });
@@ -2672,7 +2774,9 @@ impl App {
                 None => ui.monospace(format!("{:>27}", "")),
             };
             ui.separator();
-            ui.monospace(format!("zoom {:.0}%", self.view.zoom * 100.0));
+            if let Some(view) = self.viewports[self.active_viewport].camera() {
+                ui.monospace(format!("zoom {:.0}%", view.zoom * 100.0));
+            }
             ui.separator();
             if let Some(server) = &self.mcp {
                 ui.weak("MCP").on_hover_text(format!("AI agents can connect at {}", server.url()));
@@ -2887,7 +2991,7 @@ impl eframe::App for App {
         egui::Panel::left("side").default_size(230.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_panel(ui));
         });
-        egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui, &frame_start));
+        egui::CentralPanel::no_frame().show(ui, |ui| self.viewports(ui, &frame_start));
         self.settings_window(&ctx);
         self.sync_mcp_server();
         self.show_palette(&ctx);
@@ -2895,5 +2999,42 @@ impl eframe::App for App {
         if self.mirror_edits(&frame_start) {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_from_before_viewports_keeps_its_camera() {
+        let old = "(pattern:(pieces:[],seams:[]),file:None,view:(center:(x:12.0,y:34.0),zoom:2.5))";
+        let s: Session = ron::from_str(old).unwrap();
+        let mut app = App::default();
+        app.restore(s);
+        assert_eq!(app.viewports.len(), 1);
+        let view = app.viewports[0].camera().unwrap();
+        assert_eq!((view.center.x, view.center.y, view.zoom), (12.0, 34.0, 2.5));
+    }
+
+    #[test]
+    fn session_round_trips_viewports() {
+        let mut app = App::default();
+        app.split_view();
+        let text = ron::to_string(&app.session()).unwrap();
+        let mut restored = App::default();
+        restored.restore(ron::from_str(&text).unwrap());
+        assert_eq!(restored.viewports.len(), 2);
+        assert_eq!(restored.active_viewport, 1);
+    }
+
+    #[test]
+    fn close_view_keeps_one() {
+        let mut app = App::default();
+        app.split_view();
+        app.close_view();
+        app.close_view();
+        assert_eq!(app.viewports.len(), 1);
+        assert_eq!(app.active_viewport, 0);
     }
 }

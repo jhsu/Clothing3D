@@ -62,6 +62,29 @@ impl View {
     }
 }
 
+/// A camera placed in a screen rectangle: how one 2D viewport maps between
+/// pattern and screen this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct Projection {
+    pub view: View,
+    pub rect: Rect,
+}
+
+impl Projection {
+    pub fn to_screen(self, p: Vec2) -> Pos2 {
+        self.view.to_screen(self.rect, p)
+    }
+
+    pub fn to_world(self, p: Pos2) -> Vec2 {
+        self.view.to_world(self.rect, p)
+    }
+
+    /// Pixels per millimetre.
+    pub fn zoom(self) -> f64 {
+        self.view.zoom
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,6 +4,7 @@ mod palette;
 mod settings;
 mod units;
 mod view;
+mod viewport;
 
 use clothes3d_core::{curves, dxf, model, sewing};
 

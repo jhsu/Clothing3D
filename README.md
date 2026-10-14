@@ -34,6 +34,7 @@ they're saved to `$XDG_CONFIG_HOME/clothes3d/settings.json`
 | Zoom at cursor | scroll wheel / pinch |
 | Pan | middle- or right-drag |
 | Fit to pattern | F |
+| Split view | View → Split view (or the palette) opens another window onto the pattern beside the active one, with its own pan and zoom; selection and tools are shared. View → Close view removes the active one. F and the zoom readout apply to the viewport under the cursor |
 | Select tool | V — drag a point to move it, drag a piece (fill or outline) to move the piece, double-click outline to insert point |
 | Nudge selected piece | arrow keys (one grid step), Shift+arrow (1 mm) |
 | Select a segment | click an edge with the Select tool (or pick it in the side panel's Segments list) |
