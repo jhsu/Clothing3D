@@ -2850,19 +2850,15 @@ impl App {
     }
 
     /// Bottom bar: hints (or the latest status message) on the left; display
-    /// toggles, units, cursor position and zoom on the right.
+    /// toggles, units and zoom on the right.
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(view) = self.viewports[self.active_viewport].camera() {
-                    ui.label(egui::RichText::new(format!("{:.0}%", view.zoom * 100.0)).monospace().color(theme::MUTED))
-                        .on_hover_text("Zoom");
-                }
-                if let Some(c) = self.cursor_world {
-                    let u = self.settings.lengths();
-                    let text = format!("x {}  y {}", u.number(c.x), u.number(c.y));
-                    ui.label(egui::RichText::new(text).monospace().color(theme::MUTED));
+                    // Fixed width, so zooming doesn't shift the rest of the bar.
+                    let zoom = egui::RichText::new(format!("{:.0}%", view.zoom * 100.0)).monospace().color(theme::MUTED);
+                    ui.add_sized([52.0, ui.available_height()], egui::Label::new(zoom)).on_hover_text("Zoom");
                 }
                 let units = match self.settings.units {
                     Units::Millimeters => "mm",
