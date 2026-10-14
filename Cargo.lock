@@ -695,7 +695,6 @@ dependencies = [
  "base64",
  "clothes3d-core",
  "eframe",
- "epaint_default_fonts",
  "rfd",
  "rmcp",
  "ron",

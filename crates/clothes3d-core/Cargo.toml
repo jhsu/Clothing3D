@@ -3,6 +3,7 @@ name = "clothes3d-core"
 description = "Platform-independent pattern model and sewing logic for clothes3d"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 i_overlay = "9.0.1"

@@ -70,11 +70,6 @@ impl Units {
         format!("{:.*}", self.decimals(), self.display_value(mm))
     }
 
-    /// `"123.4 mm"` / `"4.86 in"`.
-    pub fn format(self, mm: f64) -> String {
-        format!("{}{}", self.number(mm), self.suffix())
-    }
-
     pub fn format_area(self, mm2: f64) -> String {
         match self {
             Units::Millimeters => format!("{:.1} cm²", mm2 / 100.0),
@@ -138,6 +133,101 @@ impl Units {
     }
 }
 
+/// How lengths in inches are written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InchFormat {
+    Eighths,
+    /// Tape-measure precision, the default.
+    #[default]
+    Sixteenths,
+    ThirtySeconds,
+    Decimal,
+}
+
+impl InchFormat {
+    pub const ALL: [InchFormat; 4] =
+        [InchFormat::Eighths, InchFormat::Sixteenths, InchFormat::ThirtySeconds, InchFormat::Decimal];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            InchFormat::Eighths => "Fractions to 1/8",
+            InchFormat::Sixteenths => "Fractions to 1/16",
+            InchFormat::ThirtySeconds => "Fractions to 1/32",
+            InchFormat::Decimal => "Decimal",
+        }
+    }
+
+    fn denominator(self) -> Option<u64> {
+        match self {
+            InchFormat::Eighths => Some(8),
+            InchFormat::Sixteenths => Some(16),
+            InchFormat::ThirtySeconds => Some(32),
+            InchFormat::Decimal => None,
+        }
+    }
+}
+
+/// Display units together with how inches are written: formats lengths for
+/// people to read. (Agents get plain decimals in the display unit instead.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lengths {
+    pub units: Units,
+    pub inches: InchFormat,
+}
+
+impl Lengths {
+    /// Fraction denominator, when lengths are written as fractions.
+    fn denominator(self) -> Option<u64> {
+        match self.units {
+            Units::Inches => self.inches.denominator(),
+            Units::Millimeters => None,
+        }
+    }
+
+    /// Number without suffix: `"123.4"`, `"23 5/8"` or `"23.62"`.
+    pub fn number(self, mm: f64) -> String {
+        match self.denominator() {
+            Some(den) => fraction(self.units.display_value(mm), den),
+            None => self.units.number(mm),
+        }
+    }
+
+    /// `"123.4 mm"`, `"23 5/8 in"` or `"23.62 in"`.
+    pub fn format(self, mm: f64) -> String {
+        format!("{}{}", self.number(mm), self.units.suffix())
+    }
+
+    /// Same number as [`Self::number`], from a value already in display units.
+    pub fn number_display(self, v: f64) -> String {
+        self.number(self.units.to_mm(v))
+    }
+
+    pub fn suffix(self) -> &'static str {
+        self.units.suffix()
+    }
+
+    pub fn parse(self, s: &str) -> Option<f64> {
+        self.units.parse(s)
+    }
+}
+
+/// `v` rounded to the nearest `1/den` and written as a mixed number in
+/// lowest terms: `"23 5/8"`, `"-1/16"`, `"4"`.
+fn fraction(v: f64, den: u64) -> String {
+    let n = (v.abs() * den as f64).round() as u64;
+    let (whole, mut num, mut d) = (n / den, n % den, den);
+    while num != 0 && num % 2 == 0 && d % 2 == 0 {
+        num /= 2;
+        d /= 2;
+    }
+    let sign = if v < 0.0 && n != 0 { "-" } else { "" };
+    match (whole, num) {
+        (w, 0) => format!("{sign}{w}"),
+        (0, _) => format!("{sign}{num}/{d}"),
+        (w, _) => format!("{sign}{w} {num}/{d}"),
+    }
+}
+
 fn parse_fraction(s: &str) -> Option<f64> {
     let (num, den) = s.split_once('/')?;
     let (num, den): (f64, f64) = (num.trim().parse().ok()?, den.trim().parse().ok()?);
@@ -150,8 +240,8 @@ mod tests {
 
     #[test]
     fn conversion_and_format() {
-        assert_eq!(Units::Inches.format(25.4), "1.00 in");
-        assert_eq!(Units::Millimeters.format(12.34), "12.3 mm");
+        assert_eq!(Units::Inches.number(25.4), "1.00");
+        assert_eq!(Units::Millimeters.number(12.34), "12.3");
         assert_eq!(Units::Inches.format_area(25.4 * 25.4 * 3.0), "3.0 in²");
         assert_eq!(Units::Millimeters.format_area(250.0), "2.5 cm²");
     }
@@ -168,6 +258,26 @@ mod tests {
         assert_eq!(inch.parse("1/0"), None);
         assert_eq!(inch.parse("abc"), None);
         assert_eq!(inch.parse(""), None);
+    }
+
+    #[test]
+    fn inch_fractions() {
+        let l = Lengths { units: Units::Inches, inches: InchFormat::Sixteenths };
+        assert_eq!(l.format(23.625 * 25.4), "23 5/8 in");
+        assert_eq!(l.number(0.0625 * 25.4), "1/16");
+        assert_eq!(l.number(-0.0625 * 25.4), "-1/16");
+        assert_eq!(l.number(4.0 * 25.4), "4");
+        assert_eq!(l.number(0.01 * 25.4), "0"); // rounds to zero, no "-0"
+        assert_eq!(l.number(-0.01 * 25.4), "0");
+        assert_eq!(l.number(2.97 * 25.4), "3"); // carries into the whole number
+        let eighths = Lengths { inches: InchFormat::Eighths, ..l };
+        assert_eq!(eighths.number(0.3 * 25.4), "1/4");
+        let decimal = Lengths { inches: InchFormat::Decimal, ..l };
+        assert_eq!(decimal.format(23.62 * 25.4), "23.62 in");
+        // Millimetres ignore the inch format; fractions parse back.
+        let mm = Lengths { units: Units::Millimeters, ..l };
+        assert_eq!(mm.format(12.34), "12.3 mm");
+        assert_eq!(l.parse(&l.number(23.625 * 25.4)), Some(23.625 * 25.4));
     }
 
     #[test]

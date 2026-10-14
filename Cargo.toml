@@ -4,6 +4,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [workspace.dependencies]
 clothes3d-core = { path = "crates/clothes3d-core" }
@@ -15,6 +16,7 @@ serde_json = "1.0.154"
 name = "clothes3d"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 ab_glyph = "0.2.32"
@@ -22,7 +24,6 @@ axum = { version = "0.8.9", default-features = false, features = ["tokio", "http
 base64 = "0.23.1"
 clothes3d-core.workspace = true
 eframe = { version = "0.36.2", features = ["persistence"] }
-epaint_default_fonts = "0.36.2"
 rfd = "0.17.2"
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-streamable-http-server"] }
 serde.workspace = true

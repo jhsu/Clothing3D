@@ -2,6 +2,7 @@ mod app;
 mod mcp;
 mod palette;
 mod settings;
+mod theme;
 mod units;
 mod view;
 mod viewport;

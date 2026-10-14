@@ -17,7 +17,7 @@ The working session (pattern, seams, view, current file) is saved to
 `~/.local/share/clothes3d/app.ron` on exit and every 5 seconds, and restored on
 the next launch. A file passed on the command line takes precedence.
 
-Application settings (units, length labels, snapping, seam tolerance, segment
+Application settings (units, inch fractions or decimals, length labels, snapping, seam tolerance, segment
 edit behavior) are separate from the pattern: edit them in Edit → Settings…;
 they're saved to `$XDG_CONFIG_HOME/clothes3d/settings.json`
 (default `~/.config/clothes3d/settings.json`).
@@ -28,7 +28,7 @@ they're saved to `$XDG_CONFIG_HOME/clothes3d/settings.json`
 |---|---|
 | Command palette | Ctrl+K — fuzzy-find any tool or command (↑/↓ to pick, Enter to run, Esc to close). Commands that need a selection are shown greyed out |
 | Segment length labels | L (or View → Segment lengths) — label every segment with its length |
-| Units | View → Units, Settings, or the palette: millimetres or inches. Typed lengths use the current unit and accept fractions (`3 1/2`, `3/8`); the grid switches to inch steps |
+| Units | View → Units, Settings, or the palette: millimetres or inches. Typed lengths use the current unit and accept fractions (`3 1/2`, `3/8`); the grid switches to inch steps. Inch lengths show as fractions to 1/16 by default; Settings → Inch lengths picks 1/8, 1/32 or decimals |
 | Remove curvature | Shift+C on selected segments, double-click an edge with the Edit curve tool, right-click an edge → Remove curvature, or the Segments list button |
 | Right-click menu | right-click an edge: Remove curvature, Insert point here, Select segment |
 | Zoom at cursor | scroll wheel / pinch |
@@ -207,6 +207,8 @@ arguments are validated and throw on out-of-range values.
   - `main.rs` — entry point
   - `app.rs` — egui app: tools, viewport painting, panels, undo, file dialogs
   - `view.rs` — 2D camera (world mm ↔ screen px)
+  - `viewport.rs` — viewports: each window onto the pattern and its camera
+  - `theme.rs` — colors, egui visuals and fonts
   - `mcp/` — MCP server: tools (`mod.rs`), edits (`edit.rs`), replies
     (`report.rs`), PNG rendering (`render.rs`)
 - `crates/clothes3d-core/` — platform-independent core
@@ -214,3 +216,20 @@ arguments are validated and throw on out-of-range values.
   - `sewing.rs` — free sewing: seam spans, outline walking, seam-preserving edits
   - `dxf.rs` — DXF-AAMA/ASTM export
 - `crates/clothes3d-wasm/` — `wasm-bindgen` bindings over the core
+- `assets/fonts/` — bundled fonts, each with its license
+
+## License
+
+Clothes3D is released under the [MIT License](LICENSE).
+
+The bundled fonts are not covered by the MIT License. They are unmodified
+official releases, distributed under the
+[SIL Open Font License 1.1](https://openfontlicense.org):
+
+| Font | Used for | Copyright | License |
+|---|---|---|---|
+| [Inter Tight](https://github.com/rsms/inter) | interface text | © 2022 The Inter Project Authors | [OFL](assets/fonts/inter-tight/OFL.txt) |
+| [IBM Plex Mono](https://github.com/IBM/plex) | measurements | © 2017 IBM Corp., Reserved Font Name "Plex" | [OFL](assets/fonts/ibm-plex-mono/OFL.txt) |
+
+They are compiled into the app binary; each font file also carries its
+copyright and license in its own metadata.

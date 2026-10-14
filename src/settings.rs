@@ -6,12 +6,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::units::Units;
+use crate::units::{InchFormat, Lengths, Units};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub units: Units,
+    /// How inch lengths are written: fractions (default) or decimals.
+    pub inch_format: InchFormat,
     /// Label every segment with its length.
     pub show_lengths: bool,
     /// Draw the cut line and allowance band around pieces with seam allowance.
@@ -40,6 +42,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             units: Units::Millimeters,
+            inch_format: InchFormat::default(),
             show_lengths: false,
             show_allowance: true,
             seam_allowance: 10.0,
@@ -56,6 +59,11 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Formatting for lengths shown to the user.
+    pub fn lengths(&self) -> Lengths {
+        Lengths { units: self.units, inches: self.inch_format }
+    }
+
     pub fn path() -> Option<PathBuf> {
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())

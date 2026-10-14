@@ -5,6 +5,7 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PremultipliedColorU8, Stroke, Transform};
 
 use crate::model::{Pattern, PointKind, Vec2};
+use crate::theme;
 use crate::units::Units;
 
 pub struct RenderOptions {
@@ -130,11 +131,8 @@ fn blend(dst: PremultipliedColorU8, color: Color, coverage: f32) -> Premultiplie
     .unwrap_or(dst)
 }
 
-fn seam_color(seam: usize) -> Color {
-    const PALETTE: [(u8, u8, u8); 6] =
-        [(220, 50, 47), (38, 139, 210), (133, 153, 0), (211, 54, 130), (203, 75, 22), (42, 161, 152)];
-    let (r, g, b) = PALETTE[seam % PALETTE.len()];
-    Color::from_rgba8(r, g, b, 255)
+fn skia(c: eframe::egui::Color32) -> Color {
+    Color::from_rgba8(c.r(), c.g(), c.b(), c.a())
 }
 
 /// A "nice" scale-bar length in mm, near a fifth of `span_mm`.
@@ -173,23 +171,23 @@ pub fn render_png(pattern: &Pattern, opts: &RenderOptions) -> Result<Vec<u8>, St
     let height = (span.y * scale + 2.0 * MARGIN as f64).ceil() as u32 + 24; // room for the scale bar
     let mut pixmap = Pixmap::new(width, height).ok_or("bad image size")?;
     pixmap.fill(Color::WHITE);
-    let font = FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).map_err(|e| e.to_string())?;
+    let font = FontRef::try_from_slice(theme::UI_FONT).map_err(|e| e.to_string())?;
     let mut c = Canvas { pixmap, font, lo, scale, height: height as f32 - 24.0 };
 
-    let ink = Color::from_rgba8(30, 30, 30, 255);
-    let seg_ink = Color::from_rgba8(30, 90, 200, 255);
+    let ink = skia(theme::INK);
+    let seg_ink = skia(theme::MUTED);
 
     for &i in &shown {
         let piece = &pattern.pieces[i];
         let cut = piece.cut_line();
         if let Some(path) = c.path(&cut, true) {
-            c.fill(&path, Color::from_rgba8(246, 242, 232, 255));
-            c.stroke(&path, ink, 1.0, false);
+            c.fill(&path, skia(theme::ALLOWANCE));
+            c.stroke(&path, skia(theme::CUT_LINE), 1.0, false);
         }
         let outline = piece.flatten();
         if let Some(path) = c.path(&outline, piece.closed) {
             if piece.closed {
-                c.fill(&path, Color::from_rgba8(235, 228, 210, 255));
+                c.fill(&path, skia(theme::PAPER));
             }
             c.stroke(&path, ink, 1.5, false);
         }
@@ -201,7 +199,7 @@ pub fn render_png(pattern: &Pattern, opts: &RenderOptions) -> Result<Vec<u8>, St
             if !spans.iter().any(|s| shown.contains(&s.piece)) {
                 continue;
             }
-            let color = seam_color(si);
+            let color = skia(theme::seam(si));
             for span in spans {
                 if !shown.contains(&span.piece) {
                     continue;
@@ -238,9 +236,12 @@ pub fn render_png(pattern: &Pattern, opts: &RenderOptions) -> Result<Vec<u8>, St
             let mut pb = PathBuilder::new();
             match pt.kind {
                 PointKind::Turn => {
-                    if let Some(r) = tiny_skia::Rect::from_xywh(x - 3.0, y - 3.0, 6.0, 6.0) {
-                        pb.push_rect(r);
-                    }
+                    // Diamond, as in the editor.
+                    pb.move_to(x, y - 4.5);
+                    pb.line_to(x + 4.5, y);
+                    pb.line_to(x, y + 4.5);
+                    pb.line_to(x - 4.5, y);
+                    pb.close();
                 }
                 PointKind::Curve => pb.push_circle(x, y, 3.5),
             }

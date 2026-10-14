@@ -11,7 +11,8 @@ use crate::mcp::{self, McpServer};
 use crate::dxf;
 use crate::palette::{Entry, Palette};
 use crate::settings::Settings;
-use crate::units::Units;
+use crate::theme;
+use crate::units::{InchFormat, Lengths, Units};
 use crate::model::{Isometry, Pattern, Piece, Point, PointKind, Vec2, triangulate};
 use crate::sewing::{EdgeSpan, OutlinePos, Seam, point_at_fraction};
 use crate::view::{Projection, View};
@@ -24,8 +25,6 @@ const UNDO_LIMIT: usize = 200;
 const SESSION_KEY: &str = "session";
 /// Screen distance within which a sewing end snaps to the matching-length point.
 const MATCH_SNAP_PX: f32 = 12.0;
-const OK_COLOR: Color32 = Color32::from_rgb(0, 140, 60);
-const WARN_COLOR: Color32 = Color32::from_rgb(220, 130, 0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
@@ -295,6 +294,7 @@ impl App {
     /// Create the app, restoring the previous session from `storage`. A
     /// pattern file given on the command line takes precedence.
     pub fn new(ctx: &egui::Context, storage: Option<&dyn eframe::Storage>, path: Option<PathBuf>) -> Self {
+        theme::apply(ctx);
         let mut app = Self { egui_ctx: Some(ctx.clone()), ..Self::default() };
         let (settings, error) = Settings::load();
         app.saved_settings = settings.clone();
@@ -974,7 +974,7 @@ impl App {
         }
         self.mirror_edits(frame_start);
         let painter = ui.painter_at(area);
-        painter.rect_filled(area, 0.0, Color32::from_gray(160));
+        painter.rect_filled(area, 0.0, theme::CUT_LINE);
         for (vi, proj, hover) in frames {
             self.paint(vi, &painter, proj, hover);
         }
@@ -1255,7 +1255,7 @@ impl App {
                     self.pattern.seams.push(Seam { a, b: span });
                     self.selected_seam = Some(self.pattern.seams.len() - 1);
                     let [la, lb] = [a, span].map(|s| s.length(&self.pattern.pieces));
-                    let u = self.settings.units;
+                    let u = self.settings.lengths();
                     self.status =
                         format!("Seam created: {} ↔ {} (Δ {})", u.format(la), u.format(lb), u.format(la - lb));
                     self.sew = SewState::Idle;
@@ -1325,23 +1325,19 @@ impl App {
     fn paint(&self, vi: usize, painter: &egui::Painter, proj: Projection, hover: Option<Pos2>) {
         let rect = proj.rect;
         let painter = painter.with_clip_rect(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_gray(250));
+        painter.rect_filled(rect, 0.0, theme::PAPER);
         self.paint_grid(&painter, proj);
 
         let to_screen = |p: Vec2| proj.to_screen(p);
 
         for (pi, piece) in self.pattern.pieces.iter().enumerate() {
             let selected = self.selected_piece == Some(pi);
-            let color = if selected {
-                Color32::from_rgb(20, 110, 220)
-            } else {
-                Color32::from_rgb(40, 40, 40)
-            };
+            let color = theme::INK;
             if self.settings.show_allowance {
                 let mut cut = piece.cut_line();
                 cut.pop(); // closing vertex
                 if cut.len() >= 3 {
-                    let fill = fill_color(pi, selected).gamma_multiply(0.35);
+                    let fill = theme::ALLOWANCE;
                     let mut mesh = egui::Mesh::default();
                     for &p in &cut {
                         mesh.colored_vertex(to_screen(p), fill);
@@ -1351,12 +1347,12 @@ impl App {
                     }
                     painter.add(mesh);
                     let line: Vec<Pos2> = cut.into_iter().map(to_screen).collect();
-                    painter.add(egui::Shape::closed_line(line, Stroke::new(1.0, color)));
+                    painter.add(egui::Shape::closed_line(line, Stroke::new(1.0, theme::CUT_LINE)));
                 }
             }
             let (poly, tris) = piece.fill_triangles();
             if !tris.is_empty() {
-                let fill = fill_color(pi, selected);
+                let fill = if selected { theme::SELECTED_FILL } else { theme::PAPER };
                 let mut mesh = egui::Mesh::default();
                 for p in poly {
                     mesh.colored_vertex(to_screen(p), fill);
@@ -1372,43 +1368,32 @@ impl App {
                 painter.line(line, Stroke::new(if selected { 2.0 } else { 1.5 }, color));
             }
 
+            // Diamonds are corners, circles are smooth points. Points on the
+            // selected piece are drawn in the selection blue, filled when selected.
+            let (stroke, size) = if selected { (theme::ACCENT, 4.5) } else { (theme::MUTED, 3.5) };
             for (i, p) in piece.points.iter().enumerate() {
-                let s = to_screen(p.pos);
                 let is_sel = self.selected_points.contains(&PointRef { piece: pi, point: i });
-                let fill = if is_sel { Color32::from_rgb(240, 120, 0) } else { Color32::WHITE };
-                match p.kind {
-                    PointKind::Turn => {
-                        let r = Rect::from_center_size(s, egui::vec2(7.0, 7.0));
-                        painter.rect_filled(r, 0.0, fill);
-                        painter.rect_stroke(r, 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
-                    }
-                    PointKind::Curve => {
-                        painter.circle_filled(s, 3.5, fill);
-                        painter.circle_stroke(s, 3.5, Stroke::new(1.0, color));
-                    }
-                }
+                let fill = if is_sel { theme::ACCENT } else { theme::PAPER };
+                paint_point(&painter, to_screen(p.pos), p.kind, size, fill, Stroke::new(1.5, stroke));
             }
 
-            if let (Some(first), true) = (piece.points.first(), piece.closed || selected) {
+            // Name in the middle of the piece, clear of seam badges at its corners.
+            if let (Some((lo, hi)), true) = (piece.bounds(), piece.closed || selected) {
                 painter.text(
-                    to_screen(first.pos) + egui::vec2(6.0, -6.0),
-                    Align2::LEFT_BOTTOM,
+                    to_screen(lo.lerp(hi, 0.5)),
+                    Align2::CENTER_CENTER,
                     &piece.name,
-                    FontId::proportional(12.0),
+                    FontId::proportional(13.0),
                     color,
                 );
             }
         }
 
-        if self.settings.show_lengths {
-            self.paint_segment_lengths(&painter, proj);
-        }
-
-        let orange = Color32::from_rgb(240, 120, 0);
         for &(pi, seg) in &self.selected_segments {
             let pts: Vec<Pos2> =
                 self.pattern.pieces[pi].flatten_segment(seg).into_iter().map(to_screen).collect();
-            painter.line(pts, Stroke::new(4.0, orange));
+            painter.line(pts.clone(), Stroke::new(10.0, theme::ACCENT.gamma_multiply(0.16)));
+            painter.line(pts, Stroke::new(2.5, theme::ACCENT));
         }
         if let Some(&(pi, seg)) = self.selected_segments.last() {
             let piece = &self.pattern.pieces[pi];
@@ -1419,13 +1404,13 @@ impl App {
                     .iter()
                     .map(|&(p, s)| self.pattern.pieces[p].segment_length(s))
                     .sum();
-                format!("{} segments · {}", self.selected_segments.len(), self.settings.units.format(total))
+                format!("{} segments · {}", self.selected_segments.len(), self.settings.lengths().format(total))
             } else if self.length_input.is_empty() {
-                self.settings.units.format(piece.segment_length(seg))
+                self.settings.lengths().format(piece.segment_length(seg))
             } else {
                 format!("{}_{}  ⏎ to apply", self.length_input, self.settings.units.suffix())
             };
-            paint_label(&painter, mid + egui::vec2(12.0, -14.0), &text, Color32::from_rgb(180, 80, 0));
+            paint_label(&painter, mid + egui::vec2(12.0, -14.0), &text, theme::ACCENT);
         }
 
         self.paint_symmetry(&painter, proj);
@@ -1433,16 +1418,19 @@ impl App {
 
         for (i, seam) in self.pattern.seams.iter().enumerate() {
             let selected = self.selected_seam == Some(i);
-            self.paint_seam(&painter, proj, seam, seam_color(i), selected, true);
+            self.paint_seam(&painter, proj, seam, theme::seam(i), selected, Some(i + 1));
+        }
+        // After the seams, so their dotted connectors don't cross the labels.
+        if self.settings.show_lengths {
+            self.paint_segment_lengths(&painter, proj);
         }
         self.paint_sewing_preview(&painter, proj, hover);
         if let Some(Drag::Marquee { viewport, start, end, .. }) = self.dragging
             && viewport == vi
         {
             let area = Rect::from_two_pos(start, end);
-            let blue = Color32::from_rgb(20, 110, 220);
-            painter.rect_filled(area, 0.0, blue.gamma_multiply(0.12));
-            painter.rect_stroke(area, 0.0, Stroke::new(1.0, blue), egui::StrokeKind::Middle);
+            painter.rect_filled(area, 0.0, theme::ACCENT.gamma_multiply(0.10));
+            painter.rect_stroke(area, 0.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Middle);
         }
 
         let Some(hover) = hover else { return };
@@ -1465,19 +1453,19 @@ impl App {
                 {
                     let dashed = egui::Shape::dashed_line(
                         &[to_screen(last.pos), s],
-                        Stroke::new(1.0, Color32::from_rgb(20, 110, 220)),
+                        Stroke::new(1.0, theme::ACCENT),
                         6.0,
                         4.0,
                     );
                     painter.extend(dashed);
                     let text = if self.length_input.is_empty() {
-                        self.settings.units.format((w - last.pos).length())
+                        self.settings.lengths().format((w - last.pos).length())
                     } else {
                         format!("{}_{}  ⏎ to place", self.length_input, self.settings.units.suffix())
                     };
-                    paint_label(&painter, s + egui::vec2(12.0, 14.0), &text, Color32::DARK_GRAY);
+                    paint_label(&painter, s + egui::vec2(12.0, 14.0), &text, theme::INK);
                 }
-                painter.circle_stroke(s, 4.0, Stroke::new(1.0, Color32::from_rgb(240, 120, 0)));
+                painter.circle_stroke(s, 4.0, Stroke::new(1.5, theme::ACCENT));
             }
             Tool::AddPoint | Tool::Select | Tool::Curve => {
                 if self.tool != Tool::AddPoint
@@ -1489,7 +1477,7 @@ impl App {
                     painter.circle_stroke(
                         to_screen(pos),
                         4.0,
-                        Stroke::new(1.5, Color32::from_rgb(240, 120, 0)),
+                        Stroke::new(1.5, theme::ACCENT),
                     );
                 }
             }
@@ -1499,8 +1487,8 @@ impl App {
     /// Length label beside every segment long enough on screen to fit one,
     /// on the outside of closed pieces.
     fn paint_segment_lengths(&self, painter: &egui::Painter, proj: Projection) {
-        let units = self.settings.units;
-        let color = Color32::from_rgb(70, 70, 90);
+        let units = self.settings.lengths();
+        let color = theme::MUTED;
         for piece in &self.pattern.pieces {
             // Outward is to the right of travel for counter-clockwise outlines.
             let side = if piece.closed && piece.area() < 0.0 { -1.0 } else { 1.0 };
@@ -1550,16 +1538,15 @@ impl App {
             let margin = 24.0 / proj.zoom();
             let ends = [o + d * (lo - margin), o + d * (hi + margin)].map(|p| proj.to_screen(p));
             let selected = self.selected_piece.is_some_and(|pi| s.touches(pi));
-            let color = Color32::from_rgb(120, 60, 200);
+            let color = theme::MUTED;
             let stroke = if selected { Stroke::new(1.5, color) } else { Stroke::new(1.0, color.gamma_multiply(0.6)) };
             painter.extend(egui::Shape::dashed_line(&ends, stroke, 10.0, 6.0));
         }
-        let orange = Color32::from_rgb(240, 120, 0);
         for r in &self.selected_points {
             for (piece, point) in self.pattern.mirror_images(r.piece, r.point) {
                 if !self.selected_points.contains(&PointRef { piece, point }) {
                     let s = proj.to_screen(pieces[piece].points[point].pos);
-                    painter.circle_stroke(s, 6.5, Stroke::new(1.5, orange));
+                    painter.circle_stroke(s, 7.0, Stroke::new(1.5, theme::ACCENT));
                 }
             }
         }
@@ -1568,7 +1555,7 @@ impl App {
     /// Handles of the selected points / segment ends. Explicit handles are
     /// solid; automatic ones (curve points without handles) are dashed.
     fn paint_handles(&self, painter: &egui::Painter, proj: Projection) {
-        let color = Color32::from_rgb(120, 60, 200);
+        let color = theme::ACCENT;
         for r in self.handle_points() {
             let piece = &self.pattern.pieces[r.piece];
             let point = &piece.points[r.point];
@@ -1582,14 +1569,15 @@ impl App {
                 } else {
                     painter.extend(egui::Shape::dashed_line(&[base, tip], Stroke::new(1.0, color), 4.0, 3.0));
                 }
-                painter.circle_filled(tip, 4.0, if explicit { color } else { Color32::WHITE });
+                painter.circle_filled(tip, 4.0, if explicit { color } else { theme::PAPER });
                 painter.circle_stroke(tip, 4.0, Stroke::new(1.2, color));
             }
         }
     }
 
-    /// Draw a span along its outline with a perpendicular notch at its start.
-    /// Returns the span's screen polyline.
+    /// Draw a span along its outline with a perpendicular notch at its start,
+    /// and `badge` text in a disc beside the notch. Returns the span's screen
+    /// polyline.
     fn paint_span(
         &self,
         painter: &egui::Painter,
@@ -1597,6 +1585,7 @@ impl App {
         span: &EdgeSpan,
         color: Color32,
         width: f32,
+        badge: Option<&str>,
     ) -> Vec<Pos2> {
         let pts: Vec<Pos2> = span
             .polyline(&self.pattern.pieces)
@@ -1611,14 +1600,49 @@ impl App {
         if let Some(dir) =
             pts.windows(2).map(|w| w[1] - w[0]).find(|d| d.length() > 0.5).map(|d| d.normalized())
         {
-            let n = egui::vec2(-dir.y, dir.x) * 12.0;
-            painter.line_segment([pts[0] - n, pts[0] + n], Stroke::new(width, color));
+            let n = egui::vec2(-dir.y, dir.x);
+            painter.line_segment([pts[0] - n * 12.0, pts[0] + n * 12.0], Stroke::new(width, color));
+            if let Some(text) = badge {
+                let at = self.badge_pos(proj, span.piece, &pts);
+                painter.circle_filled(at, 9.0, color);
+                painter.text(at, Align2::CENTER_CENTER, text, FontId::proportional(9.5), theme::PAPER);
+            }
         }
         pts
     }
 
-    /// Draw a seam: both spans, dotted connectors, and a warning badge when
-    /// the lengths differ by more than the tolerance (if `badge`).
+    /// Where to put a span's badge: a little way along it from the start,
+    /// clear of the corner point and notch, on the inside of its piece.
+    fn badge_pos(&self, proj: Projection, piece: usize, pts: &[Pos2]) -> Pos2 {
+        const ALONG: f32 = 22.0;
+        const ACROSS: f32 = 12.0;
+        let total: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+        let mut left = ALONG.min(total * 0.5);
+        let (mut at, mut dir) = (pts[0], egui::Vec2::X);
+        for w in pts.windows(2) {
+            let d = w[0].distance(w[1]);
+            if d < 1e-3 {
+                continue;
+            }
+            dir = (w[1] - w[0]) / d;
+            if d >= left {
+                at = w[0] + dir * left;
+                break;
+            }
+            left -= d;
+            at = w[1];
+        }
+        let n = egui::vec2(-dir.y, dir.x);
+        let piece = &self.pattern.pieces[piece];
+        [at + n * ACROSS, at - n * ACROSS]
+            .into_iter()
+            .find(|&c| piece.closed && piece.contains(proj.to_world(c)))
+            .unwrap_or(at + n * ACROSS)
+    }
+
+    /// Draw a seam: both spans, dotted connectors, and for a created seam
+    /// (`number`, counting from 1) `nA`/`nB` badges at the span starts and a
+    /// warning badge when the lengths differ by more than the tolerance.
     fn paint_seam(
         &self,
         painter: &egui::Painter,
@@ -1626,11 +1650,12 @@ impl App {
         seam: &Seam,
         color: Color32,
         selected: bool,
-        badge: bool,
+        number: Option<usize>,
     ) {
         let width = if selected { 4.0 } else { 2.5 };
-        let a = self.paint_span(painter, proj, &seam.a, color, width);
-        let b = self.paint_span(painter, proj, &seam.b, color, width);
+        let [ba, bb] = ["A", "B"].map(|side| number.map(|n| format!("{n}{side}")));
+        let a = self.paint_span(painter, proj, &seam.a, color, width, ba.as_deref());
+        let b = self.paint_span(painter, proj, &seam.b, color, width, bb.as_deref());
         if a.len() < 2 || b.len() < 2 {
             return;
         }
@@ -1647,11 +1672,11 @@ impl App {
         }
 
         let [la, lb] = seam.spans().map(|s| s.length(&self.pattern.pieces));
-        if badge && (la - lb).abs() > self.settings.seam_tolerance {
+        if number.is_some() && (la - lb).abs() > self.settings.seam_tolerance {
             let mid = to_pos(point_at_fraction(&wa, 0.5).lerp(point_at_fraction(&wb, 0.5), 0.5));
-            painter.circle_filled(mid, 8.0, WARN_COLOR);
-            painter.text(mid, Align2::CENTER_CENTER, "!", FontId::proportional(12.0), Color32::WHITE);
-            paint_label(painter, mid + egui::vec2(12.0, 0.0), &format!("Δ {}", self.settings.units.format(la - lb)), WARN_COLOR);
+            painter.circle_filled(mid, 8.0, theme::WARN);
+            painter.text(mid, Align2::CENTER_CENTER, "!", FontId::proportional(12.0), theme::PAPER);
+            paint_label(painter, mid + egui::vec2(12.0, 0.0), &format!("Δ {}", self.settings.lengths().format(la - lb)), theme::WARN);
         }
     }
 
@@ -1660,8 +1685,9 @@ impl App {
             return;
         }
         let pieces = &self.pattern.pieces;
-        let u = self.settings.units;
-        let color = seam_color(self.pattern.seams.len());
+        let u = self.settings.lengths();
+        // A seam being made is in the selection blue; it takes its own color once created.
+        let color = theme::ACCENT;
         let no_snap = painter.ctx().input(|i| i.modifiers.alt);
         let pending = hover.and_then(|h| self.pending_span(proj, h, no_snap));
         let marker = |piece: usize, at: OutlinePos| {
@@ -1676,16 +1702,16 @@ impl App {
             SewState::FirstStart(pi, start) => {
                 marker(pi, start);
                 if let Some((span, _)) = pending {
-                    self.paint_span(painter, proj, &span, color.gamma_multiply(0.6), 2.5);
-                    readout = Some((format!("A {}", u.format(span.length(pieces))), Color32::DARK_GRAY));
+                    self.paint_span(painter, proj, &span, color.gamma_multiply(0.6), 2.5, None);
+                    readout = Some((format!("A {}", u.format(span.length(pieces))), theme::INK));
                 }
             }
             SewState::First(a) => {
-                self.paint_span(painter, proj, &a, color, 2.5);
-                readout = Some((format!("A {}", u.format(a.length(pieces))), Color32::DARK_GRAY));
+                self.paint_span(painter, proj, &a, color, 2.5, None);
+                readout = Some((format!("A {}", u.format(a.length(pieces))), theme::INK));
             }
             SewState::SecondStart(a, pi, start) => {
-                self.paint_span(painter, proj, &a, color, 2.5);
+                self.paint_span(painter, proj, &a, color, 2.5, None);
                 marker(pi, start);
                 if self.settings.snap_match && !no_snap {
                     for end in self.matching_ends(&a, pi, start) {
@@ -1695,16 +1721,16 @@ impl App {
                             .to_vec();
                         painter.add(egui::Shape::convex_polygon(
                             diamond,
-                            Color32::WHITE,
-                            Stroke::new(2.0, OK_COLOR),
+                            theme::PAPER,
+                            Stroke::new(2.0, theme::OK),
                         ));
                     }
                 }
                 let la = a.length(pieces);
-                readout = Some((format!("A {}", u.format(la)), Color32::DARK_GRAY));
+                readout = Some((format!("A {}", u.format(la)), theme::INK));
                 if let Some((b, snapped)) = pending {
                     let seam = Seam { a, b };
-                    self.paint_seam(painter, proj, &seam, color.gamma_multiply(0.6), false, false);
+                    self.paint_seam(painter, proj, &seam, color.gamma_multiply(0.6), false, None);
                     let lb = b.length(pieces);
                     let ok = (la - lb).abs() <= self.settings.seam_tolerance;
                     readout = Some((
@@ -1715,7 +1741,7 @@ impl App {
                             u.number(la - lb),
                             if snapped { "  (matched)" } else { "" }
                         ),
-                        if ok { OK_COLOR } else { WARN_COLOR },
+                        if ok { theme::OK } else { theme::WARN },
                     ));
                 }
             }
@@ -1740,7 +1766,7 @@ impl App {
         let lo = proj.to_world(rect.left_bottom());
         let hi = proj.to_world(rect.right_top());
 
-        for (step, color) in [(minor, Color32::from_gray(235)), (major, Color32::from_gray(210))] {
+        for (step, color) in [(minor, theme::GRID_MINOR), (major, theme::GRID_MAJOR)] {
             let stroke = Stroke::new(1.0, color);
             let mut x = (lo.x / step).floor() * step;
             while x <= hi.x {
@@ -1759,11 +1785,11 @@ impl App {
         let origin = proj.to_screen(Vec2::default());
         painter.line_segment(
             [Pos2::new(rect.left(), origin.y), Pos2::new(rect.right(), origin.y)],
-            Stroke::new(1.0, Color32::from_rgb(230, 150, 150)),
+            Stroke::new(1.0, theme::SEAMS[0].gamma_multiply(0.45)),
         );
         painter.line_segment(
             [Pos2::new(origin.x, rect.top()), Pos2::new(origin.x, rect.bottom())],
-            Stroke::new(1.0, Color32::from_rgb(150, 200, 150)),
+            Stroke::new(1.0, theme::OK.gamma_multiply(0.45)),
         );
     }
 
@@ -2181,7 +2207,7 @@ impl App {
         ui.checkbox(&mut self.settings.snap_points, "Snap to points");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.settings.snap_grid, "Grid (G)");
-            let units = self.settings.units;
+            let units = self.settings.lengths();
             ui.add_enabled_ui(self.settings.snap_grid, |ui| {
                 length_value(ui, &mut self.settings.snap_step, units, 0.1..=1000.0);
             });
@@ -2193,7 +2219,7 @@ impl App {
             .on_hover_text("While sewing the second edge, snap its end to where its length equals the first edge. Hold Alt to bypass.");
         ui.horizontal(|ui| {
             ui.label("Tolerance");
-            let units = self.settings.units;
+            let units = self.settings.lengths();
             length_value(ui, &mut self.settings.seam_tolerance, units, 0.0..=50.0)
                 .on_hover_text("Seams whose edge lengths differ by more than this are flagged");
         });
@@ -2235,7 +2261,7 @@ impl App {
             if piece.closed {
                 ui.label(format!("Area: {}", self.settings.units.format_area(piece.area().abs())));
             }
-            ui.label(format!("Perimeter: {}", self.settings.units.format(piece.perimeter())));
+            ui.label(format!("Perimeter: {}", self.settings.lengths().format(piece.perimeter())));
             self.symmetry_panel(ui, pi);
             if self.pattern.pieces[pi].closed {
                 self.allowance_panel(ui, pi);
@@ -2268,7 +2294,7 @@ impl App {
             let kind_before = p.kind;
             let mut begin_edit = false;
             let mut clear_handles = false;
-            let units = self.settings.units;
+            let units = self.settings.lengths();
             egui::Grid::new("point").num_columns(2).show(ui, |ui| {
                 for (label, v) in [("X", &mut p.pos.x), ("Y", &mut p.pos.y)] {
                     ui.label(label);
@@ -2333,7 +2359,7 @@ impl App {
     /// Whole-piece seam allowance: add, edit or remove it, and reset
     /// per-segment widths back to it.
     fn allowance_panel(&mut self, ui: &mut egui::Ui, pi: usize) {
-        let units = self.settings.units;
+        let units = self.settings.lengths();
         let piece = &self.pattern.pieces[pi];
         let overrides = piece.points.iter().filter(|p| p.allowance.is_some()).count();
         let mut width = piece.seam_allowance;
@@ -2477,7 +2503,7 @@ impl App {
             return;
         }
         let additive = ui.input(|i| i.modifiers.shift);
-        let units = self.settings.units;
+        let units = self.settings.lengths();
         let mut select = None;
         let mut begin_edit = false;
         let mut change = None;
@@ -2564,7 +2590,7 @@ impl App {
         if !self.selected_segments.iter().all(|&(p, _)| self.pattern.pieces[p].closed) {
             return;
         }
-        let units = self.settings.units;
+        let units = self.settings.lengths();
         let mut width = self.pattern.pieces[p0].segment_allowance(s0);
         let any_own = self.selected_segments.iter().any(|&(p, s)| self.pattern.pieces[p].points[s].allowance.is_some());
         let mut begin_edit = false;
@@ -2610,10 +2636,10 @@ impl App {
                 i + 1,
                 pieces[seam.a.piece].name,
                 pieces[seam.b.piece].name,
-                self.settings.units.number(la - lb),
+                self.settings.lengths().number(la - lb),
                 if mismatch { "  ⚠" } else { "" }
             ))
-            .color(seam_color(i));
+            .color(theme::seam(i));
             let resp = ui.selectable_label(self.selected_seam == Some(i), text);
             if resp.clicked() {
                 clicked = Some(i);
@@ -2621,7 +2647,7 @@ impl App {
             if mismatch {
                 resp.on_hover_text(format!(
                     "Edge lengths differ by more than the {} tolerance",
-                    self.settings.units.format(self.settings.seam_tolerance)
+                    self.settings.lengths().format(self.settings.seam_tolerance)
                 ));
             }
         }
@@ -2633,7 +2659,7 @@ impl App {
         let Some(i) = self.selected_seam else { return };
         let seam = self.pattern.seams[i];
         let [la, lb] = seam.spans().map(|s| s.length(&self.pattern.pieces));
-        let u = self.settings.units;
+        let u = self.settings.lengths();
         ui.label(format!("Edge A: {}   Edge B: {}", u.format(la), u.format(lb)));
         ui.horizontal(|ui| {
             if ui.button("Flip B").on_hover_text("Reverse direction of edge B").clicked() {
@@ -2672,6 +2698,18 @@ impl App {
                 });
                 ui.end_row();
 
+                ui.label("Inch lengths");
+                egui::ComboBox::from_id_salt("inch_format")
+                    .selected_text(s.inch_format.name())
+                    .show_ui(ui, |ui| {
+                        for f in InchFormat::ALL {
+                            ui.selectable_value(&mut s.inch_format, f, f.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text("How lengths are written when units are inches");
+                ui.end_row();
+
                 ui.label("Segment lengths");
                 ui.checkbox(&mut s.show_lengths, "Label every segment (L)");
                 ui.end_row();
@@ -2681,7 +2719,7 @@ impl App {
                     ui.checkbox(&mut s.show_allowance, "Show cut line");
                     ui.horizontal(|ui| {
                         ui.label("Default width");
-                        let units = s.units;
+                        let units = s.lengths();
                         length_value(ui, &mut s.seam_allowance, units, 0.0..=500.0)
                             .on_hover_text("Width given to a piece by \"Add seam allowance\"");
                     });
@@ -2693,7 +2731,7 @@ impl App {
                     ui.checkbox(&mut s.snap_points, "Snap to points");
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut s.snap_grid, "Grid step");
-                        let units = s.units;
+                        let units = s.lengths();
                         length_value(ui, &mut s.snap_step, units, 0.1..=1000.0);
                     });
                 });
@@ -2704,7 +2742,7 @@ impl App {
                     ui.checkbox(&mut s.snap_match, "Snap to matching length");
                     ui.horizontal(|ui| {
                         ui.label("Length tolerance");
-                        let units = s.units;
+                        let units = s.lengths();
                         length_value(ui, &mut s.seam_tolerance, units, 0.0..=50.0);
                     });
                 });
@@ -2768,7 +2806,7 @@ impl App {
         ui.horizontal(|ui| {
             match self.cursor_world {
                 Some(c) => {
-                    let u = self.settings.units;
+                    let u = self.settings.lengths();
                     ui.monospace(format!("x {:>8}  y {:>8}{}", u.number(c.x), u.number(c.y), u.suffix()))
                 }
                 None => ui.monospace(format!("{:>27}", "")),
@@ -2794,22 +2832,6 @@ impl App {
     }
 }
 
-/// Solid fill for a closed piece; each piece gets its own pastel hue,
-/// slightly darker when selected.
-fn fill_color(piece: usize, selected: bool) -> Color32 {
-    const PALETTE: [(u8, u8, u8); 6] = [
-        (150, 190, 235),
-        (240, 180, 150),
-        (160, 215, 170),
-        (225, 175, 220),
-        (240, 215, 140),
-        (170, 210, 215),
-    ];
-    let (r, g, b) = PALETTE[piece % PALETTE.len()];
-    let c = Color32::from_rgb(r, g, b);
-    if selected { c.gamma_multiply(0.85).to_opaque() } else { c }
-}
-
 /// Add `item` to `list`; with `toggle`, remove it instead if already present.
 fn toggle_in<T: PartialEq>(list: &mut Vec<T>, item: T, toggle: bool) {
     match list.iter().position(|x| *x == item) {
@@ -2822,6 +2844,21 @@ fn toggle_in<T: PartialEq>(list: &mut Vec<T>, item: T, toggle: bool) {
 }
 
 /// Text on a translucent white plate, readable over the grid and fills.
+/// A point marker: a diamond for a corner, a circle for a smooth point.
+fn paint_point(painter: &egui::Painter, at: Pos2, kind: PointKind, size: f32, fill: Color32, stroke: Stroke) {
+    match kind {
+        PointKind::Turn => {
+            let r = size * 1.25;
+            let diamond = [(0.0, -r), (r, 0.0), (0.0, r), (-r, 0.0)].map(|(x, y)| at + egui::vec2(x, y)).to_vec();
+            painter.add(egui::Shape::convex_polygon(diamond, fill, stroke));
+        }
+        PointKind::Curve => {
+            painter.circle_filled(at, size, fill);
+            painter.circle_stroke(at, size, stroke);
+        }
+    }
+}
+
 fn paint_label(painter: &egui::Painter, pos: Pos2, text: &str, color: Color32) {
     paint_label_at(painter, pos, Align2::LEFT_CENTER, 12.0, text, color);
 }
@@ -2829,42 +2866,31 @@ fn paint_label(painter: &egui::Painter, pos: Pos2, text: &str, color: Color32) {
 fn paint_label_at(painter: &egui::Painter, pos: Pos2, anchor: Align2, size: f32, text: &str, color: Color32) {
     let galley = painter.layout_no_wrap(text.to_owned(), FontId::monospace(size), color);
     let rect = anchor.anchor_size(pos, galley.size());
-    painter.rect_filled(rect.expand(2.0), 3.0, Color32::from_white_alpha(200));
+    painter.rect_filled(rect.expand(2.0), 3.0, theme::PAPER);
     painter.galley(rect.min, galley, color);
 }
 
-/// Drag field for a length stored in mm, shown and edited in `units`.
+/// Drag field for a length stored in mm, shown (as a fraction for inches,
+/// if so set) and edited in `lengths`' units. Typed fractions are accepted.
 fn length_value(
     ui: &mut egui::Ui,
     mm: &mut f64,
-    units: Units,
+    lengths: Lengths,
     range_mm: std::ops::RangeInclusive<f64>,
 ) -> egui::Response {
+    let units = lengths.units;
     let mut v = units.display_value(*mm);
     let resp = ui.add(
         egui::DragValue::new(&mut v)
             .speed(units.drag_speed())
-            .max_decimals(units.decimals() + 1)
+            .custom_formatter(|v, _| lengths.number_display(v))
+            .custom_parser(|s| lengths.parse(s).map(|mm| units.display_value(mm)))
             .suffix(units.suffix()),
     );
     if resp.changed() {
         *mm = units.to_mm(v).clamp(*range_mm.start(), *range_mm.end());
     }
     resp
-}
-
-/// Distinct, saturated color per seam so pairs are easy to tell apart.
-fn seam_color(seam: usize) -> Color32 {
-    const PALETTE: [(u8, u8, u8); 6] = [
-        (220, 40, 120),
-        (0, 150, 110),
-        (230, 110, 0),
-        (110, 60, 210),
-        (0, 120, 200),
-        (170, 140, 0),
-    ];
-    let (r, g, b) = PALETTE[seam % PALETTE.len()];
-    Color32::from_rgb(r, g, b)
 }
 
 // -------------------------------------------------------------------- MCP
