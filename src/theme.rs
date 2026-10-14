@@ -21,7 +21,7 @@ pub const LINE: Color32 = Color32::from_rgb(0xE2, 0xE2, 0xDE);
 pub const GRID_MINOR: Color32 = Color32::from_rgb(0xEF, 0xEF, 0xEC);
 pub const GRID_MAJOR: Color32 = Color32::from_rgb(0xDE, 0xDE, 0xD9);
 /// Secondary text and labels.
-pub const MUTED: Color32 = Color32::from_rgb(0x6B, 0x6E, 0x73);
+pub const MUTED: Color32 = Color32::from_rgb(0x5F, 0x62, 0x67);
 /// Graphite: text and sew lines.
 pub const INK: Color32 = Color32::from_rgb(0x1C, 0x1E, 0x21);
 /// Tailor's chalk blue: selection, hover, and edits in progress.
@@ -32,9 +32,9 @@ pub const SELECTED_FILL: Color32 = Color32::from_rgb(0xF2, 0xF5, 0xFD);
 pub const ALLOWANCE: Color32 = Color32::from_rgb(0xF1, 0xF3, 0xF7);
 pub const CUT_LINE: Color32 = Color32::from_rgb(0xAE, 0xB4, 0xBF);
 /// Within tolerance.
-pub const OK: Color32 = Color32::from_rgb(0x23, 0x92, 0x5E);
+pub const OK: Color32 = Color32::from_rgb(0x1B, 0x7A, 0x4D);
 /// Out of tolerance; dark enough to read as text.
-pub const WARN: Color32 = Color32::from_rgb(0xB8, 0x7A, 0x00);
+pub const WARN: Color32 = Color32::from_rgb(0x94, 0x62, 0x00);
 
 /// Seam identity colors, in order of creation: chalk red, ochre, teal,
 /// violet, moss, cocoa. No blue: that means "selected".
@@ -52,6 +52,25 @@ pub fn seam(i: usize) -> Color32 {
     SEAMS[i % SEAMS.len()]
 }
 
+/// Text color for labels drawn on a `bg` fill (badges, chips): ink or
+/// paper, whichever contrasts more.
+pub fn on(bg: Color32) -> Color32 {
+    if contrast(INK, bg) >= contrast(PAPER, bg) { INK } else { PAPER }
+}
+
+/// WCAG 2 contrast ratio between two opaque colors (1 to 21).
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    fn luminance(c: Color32) -> f32 {
+        let lin = |v: u8| {
+            let v = f32::from(v) / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 /// Light egui visuals in the chalk palette.
 pub fn visuals() -> Visuals {
     let mut v = Visuals::light();
@@ -62,6 +81,7 @@ pub fn visuals() -> Visuals {
     v.extreme_bg_color = PAPER;
     v.hyperlink_color = ACCENT;
     v.warn_fg_color = WARN;
+    v.weak_text_color = Some(MUTED);
     v.selection.bg_fill = ACCENT;
     v.selection.stroke = Stroke::new(1.0, PAPER);
     let w = &mut v.widgets;
@@ -76,7 +96,37 @@ pub fn visuals() -> Visuals {
     w.hovered.bg_fill = Color32::from_rgb(0xDD, 0xDD, 0xD8);
     w.hovered.bg_stroke = Stroke::new(1.0, CUT_LINE);
     w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    // Fields and buttons 6, menus and windows 8 (see the component sheets).
+    for state in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        state.corner_radius = 6.into();
+        state.expansion = 0.0;
+    }
+    v.menu_corner_radius = 8.into();
+    v.window_corner_radius = 8.into();
+    let shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(30) };
+    v.popup_shadow = shadow;
+    v.window_shadow = shadow;
     v
+}
+
+/// Spacing and text sizes from the type scale: 13 px body and buttons,
+/// 11 px small labels, roomier buttons.
+fn style(style: &mut egui::Style) {
+    use egui::{FontId, TextStyle};
+    style.text_styles = [
+        (TextStyle::Small, FontId::proportional(11.0)),
+        (TextStyle::Body, FontId::proportional(13.0)),
+        (TextStyle::Button, FontId::proportional(13.0)),
+        (TextStyle::Heading, FontId::proportional(18.0)),
+        (TextStyle::Monospace, FontId::monospace(13.0)),
+    ]
+    .into();
+    let s = &mut style.spacing;
+    s.item_spacing = egui::vec2(8.0, 6.0);
+    s.button_padding = egui::vec2(10.0, 4.0);
+    s.interact_size.y = 24.0;
+    s.menu_margin = egui::Margin::same(6);
+    s.window_margin = egui::Margin::same(14);
 }
 
 /// Inter Tight for text and IBM Plex Mono for numbers, ahead of egui's own
@@ -98,6 +148,7 @@ pub fn fonts() -> FontDefinitions {
 pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Light);
     ctx.set_visuals_of(egui::Theme::Light, visuals());
+    ctx.style_mut_of(egui::Theme::Light, style);
     ctx.set_fonts(fonts());
 }
 
@@ -130,5 +181,37 @@ mod tests {
             assert!((hue(c) - blue).abs() > 30.0, "{c:?} is too close to the selection blue");
         }
         assert_eq!(seam(SEAMS.len()), seam(0));
+    }
+
+    #[test]
+    fn text_is_readable_on_its_backgrounds() {
+        // WCAG AA for small text: 4.5:1.
+        let hover = Color32::from_rgb(0xE7, 0xE7, 0xE3);
+        for (name, text, bg) in [
+            ("ink on paper", INK, PAPER),
+            ("muted on paper", MUTED, PAPER),
+            ("muted on chrome", MUTED, CHROME),
+            ("muted on hovered control", MUTED, hover),
+            ("muted on line (hovered row)", MUTED, LINE),
+            ("warn on paper", WARN, PAPER),
+            ("warn on chrome", WARN, CHROME),
+            ("ok on paper", OK, PAPER),
+            ("ok on chrome", OK, CHROME),
+            ("accent on paper", ACCENT, PAPER),
+            ("accent on chrome", ACCENT, CHROME),
+            ("paper on accent (selected rows, active tool)", PAPER, ACCENT),
+        ] {
+            let c = contrast(text, bg);
+            assert!(c >= 4.5, "{name}: {c:.2}");
+        }
+    }
+
+    #[test]
+    fn badge_text_picks_the_readable_ink() {
+        assert_eq!(on(SEAMS[1]), INK); // ochre is light
+        assert_eq!(on(SEAMS[3]), PAPER); // violet is dark
+        for c in SEAMS {
+            assert!(contrast(on(c), c) >= 4.0, "{c:?}: {:.2}", contrast(on(c), c));
+        }
     }
 }

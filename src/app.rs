@@ -17,6 +17,7 @@ use crate::model::{Isometry, Pattern, Piece, Point, PointKind, Vec2, triangulate
 use crate::sewing::{EdgeSpan, OutlinePos, Seam, point_at_fraction};
 use crate::view::{Projection, View};
 use crate::viewport::{self, Viewport};
+use crate::widgets::{self, SeamRow, ToolIcon};
 
 /// Pick radius for points and lines, in screen pixels.
 const PICK_PX: f32 = 8.0;
@@ -45,6 +46,29 @@ impl Tool {
             Tool::Sew => "Free sewing (S)",
         }
     }
+
+    fn icon(self) -> ToolIcon {
+        match self {
+            Tool::Select => ToolIcon::Select,
+            Tool::Draw => ToolIcon::Draw,
+            Tool::AddPoint => ToolIcon::AddPoint,
+            Tool::Curve => ToolIcon::Curve,
+            Tool::Sew => ToolIcon::Sew,
+        }
+    }
+
+    /// Shortcut key.
+    fn key(self) -> &'static str {
+        match self {
+            Tool::Select => "V",
+            Tool::Draw => "P",
+            Tool::AddPoint => "A",
+            Tool::Curve => "E",
+            Tool::Sew => "S",
+        }
+    }
+
+    const ALL: [Tool; 5] = [Tool::Select, Tool::Draw, Tool::AddPoint, Tool::Curve, Tool::Sew];
 
     /// Longer help, shown on the tool's button.
     fn help(self) -> &'static str {
@@ -979,6 +1003,45 @@ impl App {
         for (vi, proj, hover) in frames {
             self.paint(vi, &painter, proj, hover);
         }
+        self.tool_dock(ui.ctx(), area);
+    }
+
+    /// Floating tool dock at the bottom center of the canvas `area`.
+    fn tool_dock(&mut self, ctx: &egui::Context, area: Rect) {
+        egui::Area::new(egui::Id::new("tool_dock"))
+            .pivot(Align2::CENTER_BOTTOM)
+            .fixed_pos(area.center_bottom() - egui::vec2(0.0, 16.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .stroke(Stroke::new(1.0, theme::LINE))
+                    .corner_radius(12.0)
+                    .inner_margin(5.0)
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha(26) })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for tool in Tool::ALL {
+                                let tip = format!("{}\n\n{}", tool.label(), tool.help());
+                                if widgets::tool_button(ui, tool.icon(), tool.key(), self.tool == tool)
+                                    .on_hover_text(tip)
+                                    .clicked()
+                                {
+                                    self.set_tool(tool);
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.separator();
+                            let commands = egui::Button::new(egui::RichText::new("Commands").color(theme::MUTED))
+                                .frame(false);
+                            if ui.add(commands).on_hover_text("Command palette (Ctrl K)").clicked() {
+                                self.palette.open();
+                            }
+                            widgets::key_cap(ui, "Ctrl K");
+                            ui.add_space(4.0);
+                        });
+                    });
+            });
     }
 
     /// Navigation and tool input for viewport `vi`. Returns its projection
@@ -1594,7 +1657,7 @@ impl App {
             if let Some(text) = badge {
                 let at = self.badge_pos(proj, span.piece, &pts);
                 painter.circle_filled(at, 9.0, color);
-                painter.text(at, Align2::CENTER_CENTER, text, FontId::proportional(9.5), theme::PAPER);
+                painter.text(at, Align2::CENTER_CENTER, text, FontId::proportional(9.5), theme::on(color));
             }
         }
         pts
@@ -2184,15 +2247,7 @@ impl App {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Tools");
-        for tool in [Tool::Select, Tool::Draw, Tool::AddPoint, Tool::Curve, Tool::Sew] {
-            if ui.selectable_label(self.tool == tool, tool.label()).on_hover_text(tool.help()).clicked() {
-                self.set_tool(tool);
-            }
-        }
-
-        ui.separator();
-        ui.heading("Snapping");
+        widgets::section_header(ui, "SNAPPING", None);
         ui.checkbox(&mut self.settings.snap_points, "Snap to points");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.settings.snap_grid, "Grid (G)");
@@ -2202,8 +2257,7 @@ impl App {
             });
         });
 
-        ui.separator();
-        ui.heading("Sewing");
+        widgets::section_header(ui, "SEWING", None);
         ui.checkbox(&mut self.settings.snap_match, "Snap to matching length")
             .on_hover_text("While sewing the second edge, snap its end to where its length equals the first edge. Hold Alt to bypass.");
         ui.horizontal(|ui| {
@@ -2213,8 +2267,7 @@ impl App {
                 .on_hover_text("Seams whose edge lengths differ by more than this are flagged");
         });
 
-        ui.separator();
-        ui.heading("Pieces");
+        widgets::section_header(ui, "PIECES", Some(&self.pattern.pieces.len().to_string()));
         let mut clicked = None;
         for (i, piece) in self.pattern.pieces.iter().enumerate() {
             let label = format!(
@@ -2236,7 +2289,9 @@ impl App {
         self.seams_panel(ui);
 
         if let Some(pi) = self.selected_piece {
-            ui.separator();
+            let piece = &self.pattern.pieces[pi];
+            let summary = format!("{} points · {}", piece.points.len(), if piece.closed { "closed" } else { "open" });
+            widgets::section_header(ui, "PIECE", Some(&summary));
             let mut name = self.pattern.pieces[pi].name.clone();
             ui.horizontal(|ui| {
                 ui.label("Name");
@@ -2260,8 +2315,7 @@ impl App {
         }
 
         if self.selected_points.len() > 1 {
-            ui.separator();
-            ui.heading(format!("{} points", self.selected_points.len()));
+            widgets::section_header(ui, "POINTS", Some(&format!("{} selected", self.selected_points.len())));
             ui.horizontal(|ui| {
                 ui.label("Type");
                 if ui.button("Turn").clicked() {
@@ -2277,8 +2331,7 @@ impl App {
         }
 
         if let Some(r) = self.single_point() {
-            ui.separator();
-            ui.heading(format!("Point {}", r.point + 1));
+            widgets::section_header(ui, "POINT", Some(&format!("#{}", r.point + 1)));
             let mut p = self.pattern.pieces[r.piece].points[r.point];
             let kind_before = p.kind;
             let mut begin_edit = false;
@@ -2613,23 +2666,39 @@ impl App {
         if self.pattern.seams.is_empty() {
             return;
         }
-        ui.separator();
-        ui.heading("Seams");
         let pieces = &self.pattern.pieces;
+        let tol = self.settings.seam_tolerance;
+        let to_check = self
+            .pattern
+            .seams
+            .iter()
+            .filter(|seam| {
+                let [la, lb] = seam.spans().map(|s| s.length(pieces));
+                (la - lb).abs() > tol
+            })
+            .count();
+        let summary = match to_check {
+            0 => self.pattern.seams.len().to_string(),
+            n => format!("{} · {n} to check", self.pattern.seams.len()),
+        };
+        widgets::section_header(ui, "SEAMS", Some(&summary));
         let mut clicked = None;
         for (i, seam) in self.pattern.seams.iter().enumerate() {
             let [la, lb] = seam.spans().map(|s| s.length(pieces));
-            let mismatch = (la - lb).abs() > self.settings.seam_tolerance;
-            let text = egui::RichText::new(format!(
-                "Seam {}: {} ↔ {}  Δ {}{}",
-                i + 1,
-                pieces[seam.a.piece].name,
-                pieces[seam.b.piece].name,
-                self.settings.lengths().number(la - lb),
-                if mismatch { "  ⚠" } else { "" }
-            ))
-            .color(theme::seam(i));
-            let resp = ui.selectable_label(self.selected_seam == Some(i), text);
+            let mismatch = (la - lb).abs() > tol;
+            let label = format!("{} ↔ {}", pieces[seam.a.piece].name, pieces[seam.b.piece].name);
+            let delta = self.settings.lengths().number(la - lb);
+            let resp = widgets::seam_row(
+                ui,
+                &SeamRow {
+                    number: i + 1,
+                    color: theme::seam(i),
+                    label: &label,
+                    delta: &delta,
+                    over_tolerance: mismatch,
+                    selected: self.selected_seam == Some(i),
+                },
+            );
             if resp.clicked() {
                 clicked = Some(i);
             }
@@ -2864,7 +2933,7 @@ impl App {
                     Units::Millimeters => "mm",
                     Units::Inches => "in",
                 };
-                if toggle_chip(ui, units, false).on_hover_text("Units: click to switch").clicked() {
+                if widgets::toggle_chip(ui, units, false).on_hover_text("Units: click to switch").clicked() {
                     self.settings.toggle_units();
                 }
                 ui.separator();
@@ -2875,7 +2944,7 @@ impl App {
                     ("SNAP", &mut s.snap_points, "Snap to points"),
                     ("GRID", &mut s.snap_grid, "Snap to grid (G)"),
                 ] {
-                    if toggle_chip(ui, label, *on).on_hover_text(tip).clicked() {
+                    if widgets::toggle_chip(ui, label, *on).on_hover_text(tip).clicked() {
                         *on = !*on;
                     }
                 }
@@ -2895,7 +2964,7 @@ impl App {
                         return;
                     }
                     for (keys, action) in self.hints() {
-                        key_cap(ui, keys);
+                        widgets::key_cap(ui, keys);
                         ui.label(action);
                         ui.add_space(6.0);
                     }
@@ -2917,29 +2986,6 @@ fn toggle_in<T: PartialEq>(list: &mut Vec<T>, item: T, toggle: bool) {
 }
 
 /// Text on a translucent white plate, readable over the grid and fills.
-/// A key or mouse action drawn as a key cap, for the hint bar.
-fn key_cap(ui: &mut egui::Ui, keys: &str) {
-    egui::Frame::new()
-        .fill(theme::PAPER)
-        .stroke(Stroke::new(1.0, theme::CUT_LINE))
-        .corner_radius(3.0)
-        .inner_margin(egui::Margin::symmetric(5, 0))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(keys).size(11.0).strong().color(theme::INK));
-        });
-}
-
-/// Small caps chip for a display toggle: blue while on.
-fn toggle_chip(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
-    let (fill, text) = if on {
-        (theme::ACCENT.gamma_multiply(0.12), theme::ACCENT)
-    } else {
-        (Color32::TRANSPARENT, theme::MUTED)
-    };
-    let text = egui::RichText::new(label).size(10.5).strong().extra_letter_spacing(0.8).color(text);
-    ui.add(egui::Button::new(text).fill(fill).stroke(Stroke::NONE).corner_radius(3.0))
-}
-
 /// A point marker: a diamond for a corner, a circle for a smooth point.
 fn paint_point(painter: &egui::Painter, at: Pos2, kind: PointKind, size: f32, fill: Color32, stroke: Stroke) {
     match kind {

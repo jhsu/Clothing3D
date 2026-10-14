@@ -6,6 +6,7 @@ mod theme;
 mod units;
 mod view;
 mod viewport;
+mod widgets;
 
 use clothes3d_core::{curves, dxf, model, sewing};
 

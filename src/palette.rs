@@ -3,7 +3,9 @@
 //! The palette knows nothing about the commands themselves; the app passes
 //! in a list of entries and gets back the index of the one chosen.
 
-use eframe::egui::{self, Color32, FontId, Key, Modifiers, RichText, text::LayoutJob};
+use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, Sense, text::LayoutJob};
+
+use crate::theme;
 
 /// One row in the palette.
 pub struct Entry {
@@ -94,18 +96,7 @@ impl Palette {
                     for (row, r) in results.iter().enumerate() {
                         let entry = &entries[r.index];
                         let selected = row == self.cursor;
-                        let resp = ui
-                            .horizontal(|ui| {
-                                let label = ui.add_enabled(
-                                    entry.enabled,
-                                    egui::Button::selectable(selected, highlighted(ui, entry.label, &r.matched)),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(entry.shortcut).monospace().weak());
-                                });
-                                label
-                            })
-                            .inner;
+                        let resp = row_ui(ui, entry, &r.matched, selected);
                         if selected && (up || down) {
                             resp.scroll_to_me(None);
                         }
@@ -125,18 +116,39 @@ impl Palette {
     }
 }
 
-/// Label with the fuzzy-matched characters emphasized.
-fn highlighted(ui: &egui::Ui, label: &str, matched: &[usize]) -> LayoutJob {
+/// One full-width row: label (matched characters underlined) and shortcut.
+/// Text colors follow the row's background so they stay readable: white on
+/// the blue cursor row, muted for commands that can't run now.
+fn row_ui(ui: &mut egui::Ui, entry: &Entry, matched: &[usize], selected: bool) -> egui::Response {
+    let sense = if entry.enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), sense);
+    let (bg, text, shortcut) = if selected {
+        (theme::ACCENT, theme::PAPER, theme::PAPER)
+    } else if !entry.enabled {
+        (Color32::TRANSPARENT, theme::MUTED, theme::MUTED)
+    } else if resp.hovered() {
+        (theme::LINE, theme::INK, theme::MUTED)
+    } else {
+        (Color32::TRANSPARENT, theme::INK, theme::MUTED)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, bg);
+    let galley = painter.layout_job(highlighted(entry.label, matched, text));
+    painter.galley(egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0), galley, text);
+    painter.text(rect.right_center() - egui::vec2(10.0, 0.0), Align2::RIGHT_CENTER, entry.shortcut, FontId::monospace(12.0), shortcut);
+    resp
+}
+
+/// Label in `color` with the fuzzy-matched characters underlined.
+fn highlighted(label: &str, matched: &[usize], color: Color32) -> LayoutJob {
     let font = FontId::proportional(14.0);
-    let normal = ui.visuals().text_color();
-    let strong = ui.visuals().strong_text_color();
     let mut job = LayoutJob::default();
     for (i, c) in label.chars().enumerate() {
         let hit = matched.contains(&i);
         let format = egui::TextFormat {
             font_id: font.clone(),
-            color: if hit { strong } else { normal },
-            underline: if hit { egui::Stroke::new(1.0, strong) } else { egui::Stroke::NONE },
+            color,
+            underline: if hit { egui::Stroke::new(1.5, color) } else { egui::Stroke::NONE },
             ..Default::default()
         };
         job.append(&c.to_string(), 0.0, format);

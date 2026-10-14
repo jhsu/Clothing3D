@@ -210,6 +210,7 @@ arguments are validated and throw on out-of-range values.
   - `view.rs` — 2D camera (world mm ↔ screen px)
   - `viewport.rs` — viewports: each window onto the pattern and its camera
   - `theme.rs` — colors, egui visuals and fonts
+  - `widgets.rs` — custom-drawn widgets: tool dock, section headers, seam rows, key caps
   - `mcp/` — MCP server: tools (`mod.rs`), edits (`edit.rs`), replies
     (`report.rs`), PNG rendering (`render.rs`)
 - `crates/clothes3d-core/` — platform-independent core
