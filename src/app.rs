@@ -7,6 +7,8 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::curves::HandleSide;
+use crate::mcp::{self, McpServer};
+use crate::dxf;
 use crate::palette::{Entry, Palette};
 use crate::settings::Settings;
 use crate::units::Units;
@@ -77,6 +79,7 @@ enum Command {
     Open,
     Save,
     SaveAs,
+    ExportDxf,
     Fit,
     ToggleGrid,
     ToggleSnapPoints,
@@ -111,6 +114,7 @@ const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Open, "Open pattern…", "Ctrl+O"),
     (Command::Save, "Save pattern", "Ctrl+S"),
     (Command::SaveAs, "Save pattern as…", ""),
+    (Command::ExportDxf, "Export DXF (AAMA/ASTM)…", ""),
     (Command::Fit, "Fit view to pattern", "F"),
     (Command::ToggleGrid, "Toggle grid snapping", "G"),
     (Command::ToggleSnapPoints, "Toggle snap to points", ""),
@@ -213,6 +217,14 @@ pub struct App {
     cursor_world: Option<Vec2>,
     fit_requested: bool,
     palette: Palette,
+    /// MCP server for AI agents, while enabled in the settings.
+    mcp: Option<McpServer>,
+    /// Why the MCP server isn't running, if starting it failed.
+    mcp_error: Option<String>,
+    /// `(enabled, port)` the MCP server was last started or stopped for.
+    mcp_applied: Option<(bool, u16)>,
+    /// For starting the MCP server, which wakes the UI on requests.
+    egui_ctx: Option<egui::Context>,
 }
 
 impl Default for App {
@@ -241,6 +253,10 @@ impl Default for App {
             cursor_world: None,
             fit_requested: false,
             palette: Palette::default(),
+            mcp: None,
+            mcp_error: None,
+            mcp_applied: None,
+            egui_ctx: None,
         }
     }
 }
@@ -248,8 +264,8 @@ impl Default for App {
 impl App {
     /// Create the app, restoring the previous session from `storage`. A
     /// pattern file given on the command line takes precedence.
-    pub fn new(storage: Option<&dyn eframe::Storage>, path: Option<PathBuf>) -> Self {
-        let mut app = Self::default();
+    pub fn new(ctx: &egui::Context, storage: Option<&dyn eframe::Storage>, path: Option<PathBuf>) -> Self {
+        let mut app = Self { egui_ctx: Some(ctx.clone()), ..Self::default() };
         let (settings, error) = Settings::load();
         app.saved_settings = settings.clone();
         app.settings = settings;
@@ -264,6 +280,7 @@ impl App {
             // Loading pushes an undo step; a fresh launch shouldn't start with one.
             app.undo.clear();
         }
+        app.sync_mcp_server();
         app
     }
 
@@ -386,6 +403,31 @@ impl App {
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
+    }
+
+    fn export_dxf(&mut self) {
+        let stem = self.file.as_ref().and_then(|f| f.file_stem()).map(|s| s.to_string_lossy().into_owned());
+        let style = stem.as_deref().unwrap_or("pattern");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("DXF (AAMA/ASTM)", &["dxf"])
+            .set_file_name(format!("{style}.dxf"))
+            .save_file()
+        else {
+            return;
+        };
+        let export = dxf::export_aama(&self.pattern, style);
+        let exported = self.pattern.pieces.len() - export.skipped.len();
+        self.status = match std::fs::write(&path, export.text) {
+            Ok(()) if export.skipped.is_empty() => {
+                format!("Exported {exported} piece(s) to {}", path.display())
+            }
+            Ok(()) => format!(
+                "Exported {exported} piece(s) to {}; skipped open piece(s): {}",
+                path.display(),
+                export.skipped.join(", ")
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        };
     }
 
     // --------------------------------------------------------------- editing
@@ -1748,6 +1790,7 @@ impl App {
             Command::Open => self.open(),
             Command::Save => self.save(false),
             Command::SaveAs => self.save(true),
+            Command::ExportDxf => self.export_dxf(),
             Command::Fit => self.fit_requested = true,
             Command::ToggleGrid => self.settings.snap_grid = !self.settings.snap_grid,
             Command::ToggleSnapPoints => self.settings.snap_points = !self.settings.snap_points,
@@ -1799,7 +1842,10 @@ impl App {
                 }
                 ui.separator();
                 ui.add_enabled(false, egui::Button::new("Import DXF (AAMA/ASTM) — coming soon"));
-                ui.add_enabled(false, egui::Button::new("Export DXF (AAMA/ASTM) — coming soon"));
+                if ui.button("Export DXF (AAMA/ASTM)…").clicked() {
+                    self.export_dxf();
+                    ui.close();
+                }
             });
             ui.menu_button("Edit", |ui| {
                 if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo  (Ctrl+Z)")).clicked() {
@@ -2224,6 +2270,29 @@ impl App {
                     ui.radio_value(&mut s.length_moves_start, true, "move start point");
                 });
                 ui.end_row();
+
+                ui.label("AI agents (MCP)");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut s.mcp_enabled, "Serve on port");
+                        ui.add(egui::DragValue::new(&mut s.mcp_port).range(1024..=65535));
+                    });
+                    match (&self.mcp, &self.mcp_error) {
+                        (Some(server), _) => {
+                            ui.horizontal(|ui| {
+                                ui.monospace(server.url());
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(server.url());
+                                }
+                            });
+                        }
+                        (None, Some(e)) => {
+                            ui.colored_label(ui.visuals().warn_fg_color, e);
+                        }
+                        (None, None) => {}
+                    }
+                });
+                ui.end_row();
             });
             ui.separator();
             ui.horizontal(|ui| {
@@ -2261,6 +2330,13 @@ impl App {
             ui.separator();
             ui.monospace(format!("zoom {:.0}%", self.view.zoom * 100.0));
             ui.separator();
+            if let Some(server) = &self.mcp {
+                ui.weak("MCP").on_hover_text(format!("AI agents can connect at {}", server.url()));
+                ui.separator();
+            } else if let Some(e) = &self.mcp_error {
+                ui.colored_label(ui.visuals().warn_fg_color, "MCP off").on_hover_text(e);
+                ui.separator();
+            }
             if self.status.is_empty() {
                 ui.label(if self.tool == Tool::Sew { self.sew_hint() } else { self.tool.hint() });
             } else {
@@ -2343,6 +2419,95 @@ fn seam_color(seam: usize) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+// -------------------------------------------------------------------- MCP
+
+impl App {
+    /// Start, stop or move the MCP server when its settings change. A failed
+    /// start isn't retried until they change again.
+    fn sync_mcp_server(&mut self) {
+        let want = (self.settings.mcp_enabled, self.settings.mcp_port);
+        if self.mcp_applied == Some(want) {
+            return;
+        }
+        self.mcp_applied = Some(want);
+        self.mcp = None;
+        self.mcp_error = None;
+        let (Some(ctx), (true, port)) = (self.egui_ctx.clone(), want) else { return };
+        match McpServer::start(port, ctx) {
+            Ok(server) => self.mcp = Some(server),
+            Err(e) => self.mcp_error = Some(e),
+        }
+    }
+
+    fn run_mcp_jobs(&mut self) {
+        let jobs = self.mcp.as_ref().map(McpServer::pending).unwrap_or_default();
+        for job in jobs {
+            job(self);
+        }
+    }
+
+    pub(crate) fn pattern(&self) -> &Pattern {
+        &self.pattern
+    }
+
+    pub(crate) fn mcp_units(&self) -> Units {
+        self.settings.units
+    }
+
+    fn mcp_fmt(&self) -> mcp::Fmt {
+        mcp::Fmt { units: self.settings.units }
+    }
+
+    /// Apply agent edits to a copy of the pattern; on success it replaces the
+    /// pattern as one undo step, on failure nothing changes.
+    pub(crate) fn mcp_edit(&mut self, label: &str, edits: &[mcp::Edit]) -> Result<mcp::Outcome, String> {
+        let env = mcp::EditEnv { units: self.settings.units, length_moves_start: self.settings.length_moves_start };
+        let mut next = self.pattern.clone();
+        // Agent input reaches core code that indexes freely; never take the app down with it.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mcp::apply_edits(edits, &mut next, &env)
+        }))
+        .unwrap_or_else(|_| Err("internal error while editing; nothing was changed".into()))?;
+        self.checkpoint();
+        self.pattern = next;
+        self.after_history_change();
+        self.status = format!("AI agent: {label}");
+        Ok(outcome)
+    }
+
+    pub(crate) fn mcp_outcome(&self, out: &mcp::Outcome) -> serde_json::Value {
+        mcp::outcome_json(self.mcp_fmt(), &self.pattern, out, self.settings.seam_tolerance)
+    }
+
+    pub(crate) fn mcp_overview(&self) -> serde_json::Value {
+        mcp::overview_json(self.mcp_fmt(), &self.pattern, self.settings.seam_tolerance)
+    }
+
+    pub(crate) fn mcp_piece(&self, piece: &mcp::PieceRef) -> Result<serde_json::Value, String> {
+        mcp::piece_json(self.mcp_fmt(), &self.pattern, piece)
+    }
+
+    pub(crate) fn mcp_selection(&self) -> serde_json::Value {
+        serde_json::json!({
+            "piece": self.selected_piece,
+            "points": self.selected_points.iter().map(|r| serde_json::json!({"piece": r.piece, "point": r.point})).collect::<Vec<_>>(),
+            "segments": self.selected_segments.iter().map(|&(piece, segment)| serde_json::json!({"piece": piece, "segment": segment})).collect::<Vec<_>>(),
+            "seam": self.selected_seam,
+        })
+    }
+
+    /// Undo (or redo); `false` if there was nothing to do.
+    pub(crate) fn mcp_undo(&mut self, redo: bool) -> bool {
+        let stack = if redo { &self.redo } else { &self.undo };
+        if stack.is_empty() {
+            return false;
+        }
+        if redo { self.redo() } else { self.undo() }
+        self.status = format!("AI agent: {}", if redo { "redo" } else { "undo" });
+        true
+    }
+}
+
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, SESSION_KEY, &self.session());
@@ -2359,6 +2524,7 @@ impl eframe::App for App {
         if ctx.input(|i| i.pointer.any_click()) {
             self.status.clear();
         }
+        self.run_mcp_jobs();
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
             if self.palette.is_open() {
                 self.palette.close();
@@ -2378,6 +2544,7 @@ impl eframe::App for App {
         });
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewport(ui));
         self.settings_window(&ctx);
+        self.sync_mcp_server();
         self.show_palette(&ctx);
     }
 }

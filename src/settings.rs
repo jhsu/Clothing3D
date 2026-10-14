@@ -24,7 +24,13 @@ pub struct Settings {
     pub seam_tolerance: f64,
     /// Segment length edits move the segment's start point instead of its end.
     pub length_moves_start: bool,
+    /// Serve the MCP server so AI agents can edit the open pattern.
+    pub mcp_enabled: bool,
+    /// Local port for the MCP server (`http://127.0.0.1:<port>/mcp`).
+    pub mcp_port: u16,
 }
+
+pub const DEFAULT_MCP_PORT: u16 = 7333;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -37,6 +43,8 @@ impl Default for Settings {
             snap_match: true,
             seam_tolerance: 1.0,
             length_moves_start: false,
+            mcp_enabled: true,
+            mcp_port: DEFAULT_MCP_PORT,
         }
     }
 }

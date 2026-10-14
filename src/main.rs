@@ -1,10 +1,11 @@
 mod app;
+mod mcp;
 mod palette;
 mod settings;
 mod units;
 mod view;
 
-use clothes3d_core::{curves, model, sewing};
+use clothes3d_core::{curves, dxf, model, sewing};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -18,7 +19,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             let path = std::env::args_os().nth(1).map(Into::into);
-            Ok(Box::new(app::App::new(cc.storage, path)))
+            Ok(Box::new(app::App::new(&cc.egui_ctx, cc.storage, path)))
         }),
     )
 }

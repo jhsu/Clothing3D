@@ -415,3 +415,13 @@ impl PatternDoc {
         Ok(s.spans().iter().map(|sp| js_sys::Float64Array::from(&flat(&sp.polyline(&self.pattern.pieces))[..])).collect())
     }
 }
+
+#[wasm_bindgen]
+impl PatternDoc {
+    /// Export closed pieces as DXF-AAMA/ASTM. Returns `{text, skipped}`,
+    /// where `skipped` lists the names of open pieces left out.
+    #[wasm_bindgen(js_name = toAamaDxf)]
+    pub fn to_aama_dxf(&self, style_name: &str) -> Result<JsValue, JsError> {
+        to_js(&clothes3d_core::dxf::export_aama(&self.pattern, style_name))
+    }
+}

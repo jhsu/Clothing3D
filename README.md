@@ -56,13 +56,118 @@ they're saved to `$XDG_CONFIG_HOME/clothes3d/settings.json`
 | Toggle grid snap | G |
 | Undo / Redo | Ctrl+Z / Ctrl+Shift+Z, Ctrl+Y |
 | Open / Save | Ctrl+O / Ctrl+S (JSON) |
+| Export DXF (AAMA/ASTM) | File → Export DXF… (or the command palette) |
+
+## AI agents (MCP)
+
+While the app runs it serves an [MCP](https://modelcontextprotocol.io) server
+at `http://127.0.0.1:7333/mcp` (Streamable HTTP), so agents such as Codex,
+opencode, Claude Code or t3code can edit the open pattern. Changes show up
+live, each tool call is one undo step, and the status bar names the agent's
+last edit. Turn it off or change the port in Edit → Settings… → AI agents.
+Only local connections are accepted, and requests from web pages are refused.
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.clothes3d]
+url = "http://127.0.0.1:7333/mcp"
+```
+
+opencode (`opencode.json`):
+
+```json
+{ "mcp": { "clothes3d": { "type": "remote", "url": "http://127.0.0.1:7333/mcp" } } }
+```
+
+Claude Code: `claude mcp add --transport http clothes3d http://127.0.0.1:7333/mcp`.
+t3code uses the MCP servers configured for the agent it runs.
+
+Lengths use your display units (mm or inches), and every reply names them.
+Agents can also spell out a unit: `"90mm"`, `"9 cm"`, `"3 1/2 in"`.
+
+| Tool | Does |
+|---|---|
+| `get_pattern` | Pieces (size, perimeter, area, bounds) and seams with both edge lengths and tolerance check |
+| `get_piece` | One piece's points, handles and segment lengths |
+| `get_selection` | What you've selected, so "make this edge longer" works |
+| `render` | PNG of the pattern or a piece, labeled with point / segment / seam indices and a scale bar |
+| `add_piece`, `set_piece_points`, `remove_piece`, `duplicate_piece`, `rename_piece` | Pieces |
+| `transform_piece`, `unfold_piece` | Flip / rotate / move; mirror across a fold |
+| `move_point`, `insert_point`, `remove_point`, `set_point_kind` | Points |
+| `set_handles`, `clear_handles`, `set_segment_handles`, `bend_segment`, `straighten_segment` | Curves |
+| `set_segment_length` | Exact lengths (arc length on curves) |
+| `add_seam`, `remove_seam`, `flip_seam` | Sewing |
+| `batch` | Several edits as one undo step; all or nothing |
+| `undo`, `redo` | History |
+
+Pieces can be named by index or name. Every edit replies with the updated
+pieces and any seams on them that no longer match. The window has to be
+open (not minimized) for tool calls to be answered.
 
 ## Model
 
 Units are millimetres, Y up (matches DXF). Each piece is a polyline of
 **turn points** (corners) and **curve points** (smoothly interpolated), which maps
 directly onto DXF-AAMA/ASTM boundary layers (1 = boundary, 2 = turn points,
-3 = curve points). DXF import/export is planned next.
+3 = curve points).
+
+### DXF-AAMA/ASTM export
+
+File → Export DXF writes an ASCII DXF R12 file in the AAMA/ASTM D6673 layout:
+one BLOCK per closed piece (inserted at the origin, so the layout is kept)
+with the boundary POLYLINE and "Piece Name" / "Quantity" text on layer 1,
+turn points on layer 2 and curve points on layer 3. Header text carries the
+style name (the file name) and `Units: METRIC` (coordinates in mm).
+
+Curved (Bézier) segments are densified: the sampled in-between vertices sit
+on the boundary without a turn/curve marker. Open pieces are skipped and
+listed in the status bar.
+
+#### Known shortcomings
+
+Not yet validated in commercial pattern CAD (Gerber AccuMark, Optitex,
+Lectra, Valentina, …); output has only been checked with the `ezdxf` reader.
+
+Geometry
+- Curves are sampled at a fixed 32 points per curved segment rather than to
+  a tolerance, so files are larger than needed and very long curves may be
+  coarse.
+- Bézier handles are lost: the outline shape is kept, but re-importing would
+  give sampled points, not editable curves. Readers that re-smooth unmarked
+  vertices may shift curves slightly.
+- A turn point with handles (smooth-looking but marked as a corner) is
+  exported as a turn point.
+- Outline winding direction is not normalized, and self-intersecting
+  outlines are not detected.
+- The outline is exported as-is on layer 1 (cut line); there is no seam
+  allowance and no separate sew line (layer 14).
+
+Units and header
+- `Units: METRIC` with coordinates in millimetres is assumed to be what
+  readers expect; this is unverified. There is no `ENGLISH` (inch) option,
+  and the app's mm/inch display setting is ignored.
+- No separate AAMA vs ASTM flavor: one layout is written, without version,
+  author, creation date/time or other ASTM-specific header text.
+  "Sample Size" and "Grading Rule Table" are written empty.
+
+Piece data
+- Quantity is always 1; no size, category, material or fabric annotations.
+- Text height is a fixed 5 mm and labels sit at the bounding-box center,
+  which may fall outside concave pieces.
+- Block names are reduced to ASCII letters, digits, `-` and `_` (and made
+  unique); the original name is kept in the "Piece Name" text, with
+  non-ASCII characters written as `\U+XXXX` escapes.
+
+Not exported
+- Seams / sewing information (AAMA has no equivalent).
+- Notches (layer 4), mirror/fold lines (6), grain lines (7), internal lines
+  (8), drill holes (13), sew lines (14).
+- Open pieces (could become internal lines) and pieces with fewer than three
+  points.
+- Grading / multiple sizes.
+
+DXF import is not implemented.
 
 Seams store each edge as positions along a piece outline (segment + parameter),
 so they follow the outline as points and pieces move.
@@ -84,6 +189,7 @@ const outline = doc.flatten(0);   // Float64Array [x0, y0, x1, y1, ...] in mm, Y
 const mesh = doc.fillMesh(0);     // { vertices: Float64Array, indices: Uint32Array }
 doc.insertPoint(0, 2, 0.5);       // seams stay attached
 const json = doc.toJson();        // same format as the desktop app's files
+const { text, skipped } = doc.toAamaDxf("style"); // DXF-AAMA/ASTM file contents
 ```
 
 Use `--target bundler` for webpack/Vite or `--target nodejs` for Node. Index
@@ -95,7 +201,10 @@ arguments are validated and throw on out-of-range values.
   - `main.rs` — entry point
   - `app.rs` — egui app: tools, viewport painting, panels, undo, file dialogs
   - `view.rs` — 2D camera (world mm ↔ screen px)
+  - `mcp/` — MCP server: tools (`mod.rs`), edits (`edit.rs`), replies
+    (`report.rs`), PNG rendering (`render.rs`)
 - `crates/clothes3d-core/` — platform-independent core
   - `model.rs` — pattern / piece / point data, curve evaluation, hit-testing
   - `sewing.rs` — free sewing: seam spans, outline walking, seam-preserving edits
+  - `dxf.rs` — DXF-AAMA/ASTM export
 - `crates/clothes3d-wasm/` — `wasm-bindgen` bindings over the core

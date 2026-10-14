@@ -3,5 +3,6 @@
 //! `wasm32-unknown-unknown` alike.
 
 pub mod curves;
+pub mod dxf;
 pub mod model;
 pub mod sewing;
