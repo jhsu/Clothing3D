@@ -1,6 +1,6 @@
 # clothes3d
 
-A Rust desktop pattern editor, aiming toward basic CLO3D-style functionality.
+A Rust pattern editor for drafting and sewing garment patterns.
 Phase 1: a 2D pattern viewport for drafting pieces with points.
 
 ## Run
