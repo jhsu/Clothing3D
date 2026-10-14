@@ -1,0 +1,16 @@
+{"pieces":[
+ {"name":"Front","closed":true,"points":[
+  {"pos":{"x":0,"y":0},"kind":"Turn"},{"pos":{"x":240,"y":0},"kind":"Turn"},
+  {"pos":{"x":250,"y":220},"kind":"Turn"},{"pos":{"x":215,"y":300},"kind":"Curve"},
+  {"pos":{"x":200,"y":390},"kind":"Turn"},{"pos":{"x":75,"y":430},"kind":"Turn"},
+  {"pos":{"x":40,"y":410},"kind":"Curve"},{"pos":{"x":0,"y":360},"kind":"Turn"}]},
+ {"name":"Back","closed":true,"points":[
+  {"pos":{"x":400,"y":0},"kind":"Turn"},{"pos":{"x":640,"y":0},"kind":"Turn"},
+  {"pos":{"x":640,"y":400},"kind":"Turn"},{"pos":{"x":590,"y":420},"kind":"Turn"},
+  {"pos":{"x":460,"y":390},"kind":"Turn"},{"pos":{"x":430,"y":300},"kind":"Curve"},
+  {"pos":{"x":390,"y":220},"kind":"Turn"}]}],
+ "seams":[
+  {"a":{"piece":0,"start":{"seg":1,"t":0.0},"end":{"seg":1,"t":1.0},"forward":true},
+   "b":{"piece":1,"start":{"seg":6,"t":1.0},"end":{"seg":6,"t":0.0},"forward":false}},
+  {"a":{"piece":0,"start":{"seg":4,"t":0.0},"end":{"seg":4,"t":1.0},"forward":true},
+   "b":{"piece":1,"start":{"seg":3,"t":1.0},"end":{"seg":3,"t":0.0},"forward":false}}]}

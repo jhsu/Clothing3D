@@ -1,0 +1,14 @@
+{"pieces":[{"name":"Front bodice","closed":true,"points":[
+{"pos":{"x":0,"y":0},"kind":"Turn"},
+{"pos":{"x":240,"y":0},"kind":"Turn"},
+{"pos":{"x":250,"y":220},"kind":"Turn"},
+{"pos":{"x":215,"y":300},"kind":"Curve"},
+{"pos":{"x":200,"y":390},"kind":"Turn"},
+{"pos":{"x":75,"y":430},"kind":"Turn"},
+{"pos":{"x":40,"y":410},"kind":"Curve"},
+{"pos":{"x":0,"y":360},"kind":"Turn"}]},
+{"name":"Sleeve","closed":false,"points":[
+{"pos":{"x":350,"y":0},"kind":"Turn"},
+{"pos":{"x":400,"y":300},"kind":"Turn"},
+{"pos":{"x":500,"y":380},"kind":"Curve"},
+{"pos":{"x":600,"y":300},"kind":"Turn"}]}]}
